@@ -47,6 +47,7 @@ CommandLineOptions parse_command_line_arguments(int argc, char **argv) {
     args::ValueFlag<int> N(parser, "INT", "Retain at most INT secondary alignments (is upper bounded by -M and depends on -S) [0]", {'N'});
     args::ValueFlag<int> supp(parser, "INT", "Report up to INT supplementary alignments with SA tags for SV calling [0, disabled]", {"supp"});
     args::ValueFlag<int> supp_overlap(parser, "INT", "Max query overlap (bp) between primary and supplementary alignments [50]", {"supp-overlap"});
+    args::ValueFlag<int> min_clip(parser, "INT", "Min soft-clip length (bp) to trigger supplementary search [15]", {"min-clip"});
     args::Flag sv_tags(parser, "sv-tags", "Add SV-related SAM tags (YT, YD, Xr, YS)", {"sv-tags"});
 
     args::Group seeding_group(parser, "Seeding:");
@@ -135,6 +136,7 @@ CommandLineOptions parse_command_line_arguments(int argc, char **argv) {
     if (N) { opt.max_secondary = args::get(N); }
     if (supp) { opt.max_supplementary = args::get(supp); }
     if (supp_overlap) { opt.max_supp_overlap = args::get(supp_overlap); }
+    if (min_clip) { opt.min_clip = args::get(min_clip); }
     if (sv_tags) { opt.sv_tags = true; }
 
     // Seeding

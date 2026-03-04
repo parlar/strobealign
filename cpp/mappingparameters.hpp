@@ -25,6 +25,7 @@ struct MappingParameters {
     int max_secondary { 0 };
     int max_supplementary { 0 };
     int max_supp_overlap { 50 };
+    int min_clip { 15 };
     float dropoff_threshold { 0.5 };
     int rescue_threshold{100};
     int max_tries { 20 };
@@ -48,6 +49,9 @@ struct MappingParameters {
         }
         if (max_supp_overlap < 0) {
             throw BadParameter("--supp-overlap must be non-negative");
+        }
+        if (min_clip < 1) {
+            throw BadParameter("--min-clip must be at least 1");
         }
     }
 };

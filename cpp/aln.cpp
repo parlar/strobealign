@@ -993,10 +993,10 @@ void build_sa_tags(
  * Check if primary alignment has enough soft clipping to warrant
  * searching for supplementary alignments.
  */
-bool has_significant_soft_clip(const Alignment& primary, int read_len, int k) {
+bool has_significant_soft_clip(const Alignment& primary, int read_len, int min_clip) {
     int left_clip = primary.query_start;
     int right_clip = read_len - primary.query_end;
-    return left_clip >= k || right_clip >= k;
+    return left_clip >= min_clip || right_clip >= min_clip;
 }
 
 /*
@@ -1016,16 +1016,17 @@ ReadSupplementaryInfo build_supplementary_info(
     float dropoff_threshold,
     unsigned max_tries,
     unsigned max_supplementary,
-    int max_supp_overlap
+    int max_supp_overlap,
+    int min_clip
 ) {
     ReadSupplementaryInfo info;
     if (max_supplementary == 0 || nams.empty() || primary.is_unaligned) {
         return info;
     }
 
-    // Early exit: if primary covers most of the read (both soft clips < k),
+    // Early exit: if primary covers most of the read (both soft clips < min_clip),
     // there's no room for a meaningful supplementary alignment
-    if (!has_significant_soft_clip(primary, read.size(), k)) {
+    if (!has_significant_soft_clip(primary, read.size(), min_clip)) {
         return info;
     }
 
@@ -1064,7 +1065,7 @@ ReadSupplementaryInfo build_supplementary_info_from_candidates(
     unsigned max_supplementary,
     int max_supp_overlap,
     int read_len,
-    int k
+    int min_clip
 ) {
     ReadSupplementaryInfo info;
     if (max_supplementary == 0 || primary.is_unaligned || candidates.empty()) {
@@ -1072,7 +1073,7 @@ ReadSupplementaryInfo build_supplementary_info_from_candidates(
     }
 
     // Early exit: if primary covers most of the read, skip
-    if (!has_significant_soft_clip(primary, read_len, k)) {
+    if (!has_significant_soft_clip(primary, read_len, min_clip)) {
         return info;
     }
 
@@ -1998,8 +1999,8 @@ void align_or_map_paired(
 
             if (map_param.max_supplementary > 0) {
                 auto k = index_parameters.syncmer.k;
-                auto si1 = build_supplementary_info(sam, aligner, nams_pair[0], read1, alignment1, mapq1, k, references, map_param.dropoff_threshold, map_param.max_tries, map_param.max_supplementary, map_param.max_supp_overlap);
-                auto si2 = build_supplementary_info(sam, aligner, nams_pair[1], read2, alignment2, mapq2, k, references, map_param.dropoff_threshold, map_param.max_tries, map_param.max_supplementary, map_param.max_supp_overlap);
+                auto si1 = build_supplementary_info(sam, aligner, nams_pair[0], read1, alignment1, mapq1, k, references, map_param.dropoff_threshold, map_param.max_tries, map_param.max_supplementary, map_param.max_supp_overlap, map_param.min_clip);
+                auto si2 = build_supplementary_info(sam, aligner, nams_pair[1], read2, alignment2, mapq2, k, references, map_param.dropoff_threshold, map_param.max_tries, map_param.max_supplementary, map_param.max_supp_overlap, map_param.min_clip);
 
                 // Combine SA tags with SV tags
                 std::string extra1 = si1.primary_sa_tag;
@@ -2124,8 +2125,6 @@ void align_or_map_paired(
                 auto& primary2 = alignment_pairs[0].alignment2;
                 bool is_proper = is_proper_pair(primary1, primary2, isize_est.mu, isize_est.sigma);
 
-                auto k = index_parameters.syncmer.k;
-
                 // Extract unique per-read alignments from scored pairs
                 // (these were already computed by align_paired, no need to re-align)
                 std::vector<Alignment> candidates1, candidates2;
@@ -2148,8 +2147,8 @@ void align_or_map_paired(
                     }
                 }
 
-                auto si1 = build_supplementary_info_from_candidates(sam, candidates1, primary1, mapq1, map_param.max_supplementary, map_param.max_supp_overlap, record1.seq.length(), k);
-                auto si2 = build_supplementary_info_from_candidates(sam, candidates2, primary2, mapq2, map_param.max_supplementary, map_param.max_supp_overlap, record2.seq.length(), k);
+                auto si1 = build_supplementary_info_from_candidates(sam, candidates1, primary1, mapq1, map_param.max_supplementary, map_param.max_supp_overlap, record1.seq.length(), map_param.min_clip);
+                auto si2 = build_supplementary_info_from_candidates(sam, candidates2, primary2, mapq2, map_param.max_supplementary, map_param.max_supp_overlap, record2.seq.length(), map_param.min_clip);
 
                 // Build SV extra tags if requested
                 std::string sv_extra1, sv_extra2;
