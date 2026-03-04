@@ -73,7 +73,7 @@ TEST_CASE("Sam::add") {
         Sam sam(sam_string, references);
         sam.add(aln, record, read_rc, 55, PRIMARY, details);
         CHECK(sam_string ==
-            "readname\t16\tcontig1\t3\t55\t2S2=1X3=3S\t*\t0\t0\tACGTT\tBB#>\tNM:i:3\tAS:i:9\tMD:Z:2G3\n"
+            "readname\t16\tcontig1\t3\t55\t2S2=1X3=3S\t*\t0\t0\tACGTT\tBB#>\tNM:i:3\tAS:i:9\tms:i:9\tde:f:0.5000\trl:i:5\ttp:A:P\ts1:i:0\ts2:i:0\tMD:Z:2G3\n"
         );
     }
     SUBCASE("Cigar M") {
@@ -81,8 +81,22 @@ TEST_CASE("Sam::add") {
         Sam sam(sam_string, references, CigarOps::M);
         sam.add(aln, record, read_rc, 55, PRIMARY, details);
         CHECK(sam_string ==
-            "readname\t16\tcontig1\t3\t55\t2S6M3S\t*\t0\t0\tACGTT\tBB#>\tNM:i:3\tAS:i:9\tMD:Z:2G3\n"
+            "readname\t16\tcontig1\t3\t55\t2S6M3S\t*\t0\t0\tACGTT\tBB#>\tNM:i:3\tAS:i:9\tms:i:9\tde:f:0.5000\trl:i:5\ttp:A:P\ts1:i:0\ts2:i:0\tMD:Z:2G3\n"
         );
+    }
+    SUBCASE("secondary alignment has tp:A:S") {
+        std::string sam_string;
+        Sam sam(sam_string, references);
+        sam.add(aln, record, read_rc, 0, SECONDARY_ALN, details);
+        // Secondary: flag 0x110 = SECONDARY|REVERSE, SEQ/QUAL are *, tp:A:S
+        CHECK(sam_string.find("\ttp:A:S\t") != std::string::npos);
+        CHECK(sam_string.find("\t0x") == std::string::npos); // sanity: no hex in output
+    }
+    SUBCASE("supplementary alignment has tp:A:S") {
+        std::string sam_string;
+        Sam sam(sam_string, references);
+        sam.add(aln, record, read_rc, 55, SUPPLEMENTARY_ALN, details);
+        CHECK(sam_string.find("\ttp:A:S\t") != std::string::npos);
     }
 }
 
@@ -136,7 +150,7 @@ TEST_CASE("Pair with one unmapped SAM record") {
     // 89: PAIRED,MUNMAP,REVERSE,READ1
     // 165: PAIRED,UNMAP,MREVERSE,READ2
     CHECK(sam_string ==
-      "readname\t89\tcontig1\t3\t55\t2=\t=\t3\t0\tGGTT\t<B!#\tNM:i:17\tAS:i:9\tMD:Z:2\n"
+      "readname\t89\tcontig1\t3\t55\t2=\t=\t3\t0\tGGTT\t<B!#\tNM:i:17\tAS:i:9\tms:i:9\tde:f:8.5000\trl:i:4\ttp:A:P\ts1:i:0\ts2:i:0\tMD:Z:2\n"
       "readname\t165\tcontig1\t3\t0\t*\t=\t3\t0\tGGTT\tIHB#\n"
     );
 }
@@ -199,8 +213,8 @@ TEST_CASE("TLEN zero when reads map to different contigs") {
     // 65: PAIRED,READ1
     // 129: PAIRED,READ2
     CHECK(sam_string ==
-    "readname\t65\tcontig1\t3\t55\t2=\tcontig2\t4\t0\tAACC\t#!B<\tNM:i:17\tAS:i:9\tMD:Z:2\tMC:Z:3=\tMQ:i:57\n"
-    "readname\t129\tcontig2\t4\t57\t3=\tcontig1\t3\t0\tGGTT\tIHB#\tNM:i:2\tAS:i:4\tMD:Z:3\tMC:Z:2=\tMQ:i:55\n"
+    "readname\t65\tcontig1\t3\t55\t2=\tcontig2\t4\t0\tAACC\t#!B<\tNM:i:17\tAS:i:9\tms:i:9\tde:f:8.5000\trl:i:4\ttp:A:P\ts1:i:0\ts2:i:0\tMD:Z:2\tMC:Z:3=\tMQ:i:57\n"
+    "readname\t129\tcontig2\t4\t57\t3=\tcontig1\t3\t0\tGGTT\tIHB#\tNM:i:2\tAS:i:4\tms:i:4\tde:f:0.6667\trl:i:4\ttp:A:P\ts1:i:0\ts2:i:0\tMD:Z:3\tMC:Z:2=\tMQ:i:55\n"
     );
 }
 

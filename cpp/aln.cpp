@@ -1,6 +1,7 @@
 #include "aln.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <numeric>
 #include <math.h>
@@ -1481,6 +1482,10 @@ void align_or_map_paired(
         nams_pair[is_r1] = get_nams_or_chains(
             record, index, chainer, statistics, details[is_r1], map_param, index_parameters, random_engine
         );
+        if (!nams_pair[is_r1].empty()) {
+            details[is_r1].s1 = std::lroundf(nams_pair[is_r1][0].score);
+            if (nams_pair[is_r1].size() > 1) details[is_r1].s2 = std::lroundf(nams_pair[is_r1][1].score);
+        }
     }
 
     Timer extend_timer;
@@ -1723,6 +1728,10 @@ void align_or_map_single(
 
     logger.trace() << "\nQuery: " << record.name << '\n';
     nams = get_nams_or_chains(record, index, chainer, statistics, details, map_param, index_parameters, random_engine);
+    if (!nams.empty()) {
+        details.s1 = std::lroundf(nams[0].score);
+        if (nams.size() > 1) details.s2 = std::lroundf(nams[1].score);
+    }
 
     Timer extend_timer;
     size_t n_best = 0;

@@ -16,6 +16,8 @@ struct Details {
     uint32_t tried_alignment{0}; // No. of computed alignments (get_alignment or rescue_mate)
     uint32_t gapped{0};  // No. of gapped alignments computed (in get_alignment)
     uint32_t best_alignments{0}; // No. of best alignments with same score
+    int s1{0}; // Best chain/NAM score
+    int s2{0}; // Second-best chain/NAM score
 
     HitsDetails hits;
 

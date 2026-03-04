@@ -1,6 +1,7 @@
 #include "sam.hpp"
 #include <algorithm>
 #include <cctype>
+#include <cstdio>
 #include <ostream>
 #include <sstream>
 #include <iostream>
@@ -222,6 +223,36 @@ void Sam::add_record(
         sam_string.append("\t");
         sam_string.append("AS:i:");
         sam_string.append(std::to_string(aln_score));
+        sam_string.append("\tms:i:");
+        sam_string.append(std::to_string(aln_score));
+
+        // Per-base divergence: de = ed / aligned_length
+        {
+            int aligned_len = 0;
+            for (auto op_len : cigar.m_ops) {
+                auto op = op_len & 0xf;
+                auto len = op_len >> 4;
+                if (op == CIGAR_EQ || op == CIGAR_X || op == CIGAR_INS || op == CIGAR_DEL) {
+                    aligned_len += len;
+                } else {
+                    assert(op != CIGAR_MATCH && "de computation requires EQ/X cigar, not M");
+                }
+            }
+            char buf[32];
+            float de = aligned_len > 0 ? static_cast<float>(ed) / aligned_len : 0.0f;
+            std::snprintf(buf, sizeof(buf), "%.4f", de);
+            sam_string.append("\tde:f:");
+            sam_string.append(buf);
+        }
+
+        sam_string.append("\trl:i:");
+        sam_string.append(std::to_string(query_sequence.length()));
+        sam_string.append("\ttp:A:");
+        sam_string.append(1, (flags & (SECONDARY | SUPPLEMENTARY)) ? 'S' : 'P');
+        sam_string.append("\ts1:i:");
+        sam_string.append(std::to_string(details.s1));
+        sam_string.append("\ts2:i:");
+        sam_string.append(std::to_string(details.s2));
     } else {
         append_qual(qual);
     }
