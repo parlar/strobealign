@@ -265,6 +265,10 @@ void Sam::add_record(
         sam_string.append(std::to_string(details.s2));
         sam_string.append("\tXp:i:");
         sam_string.append(std::to_string(details.xp));
+        sam_string.append("\tXs:i:");
+        sam_string.append(std::to_string(details.n_seeds));
+        sam_string.append("\tXc:i:");
+        sam_string.append(std::to_string(details.xc));
         if (details.xs > 0) {
             sam_string.append("\tXS:i:");
             sam_string.append(std::to_string(details.xs));

@@ -20,6 +20,8 @@ struct Details {
     int s2{0}; // Second-best chain/NAM score
     int cm{0}; // Matching seeds in primary chain (n_matches)
     int xp{0}; // Pipeline path: 0=standard, 5=fast path
+    int n_seeds{0}; // Total seeds (randstrobes) collected for this read
+    int xc{0}; // Primary chain/NAM score (before extension)
     int xs{0}; // Best non-primary alignment score (XS tag)
     float yj{-1.0f}; // Joint pair posterior probability, -1 = not set
 

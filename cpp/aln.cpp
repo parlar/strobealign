@@ -138,24 +138,346 @@ std::string compute_xr_tag(const Details& details, bool is_fast_path) {
 }
 
 /*
- * Compute YS SV-type tag for supplementary vs primary:
+ * Classify SV type for supplementary vs primary:
  *   TRA - different chromosomes (translocation)
  *   INV - same chromosome, different strands (inversion)
  *   DUP - same chromosome, same strand, reference ranges overlap (duplication)
  *   DEL - same chromosome, same strand, no reference overlap (deletion)
  */
-std::string compute_ys_tag(const Alignment& supp, const Alignment& primary) {
+std::string classify_sv_type(const Alignment& supp, const Alignment& primary) {
     if (supp.ref_id != primary.ref_id) {
-        return "YS:Z:TRA";
+        return "TRA";
     }
     if (supp.is_revcomp != primary.is_revcomp) {
-        return "YS:Z:INV";
+        return "INV";
     }
-    // Same chromosome, same strand — check for reference overlap
     int supp_end = supp.ref_start + supp.length;
     int prim_end = primary.ref_start + primary.length;
     bool overlap = (supp.ref_start < prim_end && primary.ref_start < supp_end);
-    return overlap ? "YS:Z:DUP" : "YS:Z:DEL";
+    return overlap ? "DUP" : "DEL";
+}
+
+std::string compute_ys_tag(const Alignment& supp, const Alignment& primary) {
+    return "YS:Z:" + classify_sv_type(supp, primary);
+}
+
+/*
+ * Breakpoint info for a primary-supplementary pair.
+ */
+struct BreakpointInfo {
+    int left_ref_id{-1}, right_ref_id{-1};
+    int left_bp{0}, right_bp{0};
+    int mh_fwd{0}, mh_bwd{0};
+    int left_ci{0}, right_ci{0};
+    std::string inserted_seq;
+    std::string sv_type;
+
+    std::string format_all(const References& refs) const {
+        std::string result;
+        // YB: breakpoint intervals
+        int left_lo = left_bp - mh_bwd;
+        int left_hi = left_bp + mh_fwd;
+        int right_lo = right_bp - mh_bwd;
+        int right_hi = right_bp + mh_fwd;
+        result += "YB:Z:";
+        result += refs.names[left_ref_id];
+        result += ':';
+        result += std::to_string(left_lo);
+        result += '-';
+        result += std::to_string(left_hi);
+        result += '|';
+        result += refs.names[right_ref_id];
+        result += ':';
+        result += std::to_string(right_lo);
+        result += '-';
+        result += std::to_string(right_hi);
+        // YC: CI widths
+        result += "\tYC:Z:";
+        result += std::to_string(left_ci);
+        result += ',';
+        result += std::to_string(right_ci);
+        // YM: microhomology
+        result += "\tYM:i:";
+        result += std::to_string(mh_fwd + mh_bwd);
+        // YI: inserted sequence (only if present)
+        if (!inserted_seq.empty()) {
+            result += "\tYI:Z:";
+            result += inserted_seq;
+        }
+        // YA: alternative placements (only if microhomology > 0 and <= 20)
+        int mh_total = mh_fwd + mh_bwd;
+        if (mh_total > 0 && mh_total <= 20) {
+            result += "\tYA:Z:";
+            bool first = true;
+            for (int i = -mh_bwd; i <= mh_fwd; ++i) {
+                if (!first) result += ';';
+                result += std::to_string(left_bp + i);
+                result += ',';
+                result += std::to_string(right_bp + i);
+                first = false;
+            }
+        }
+        return result;
+    }
+};
+
+/*
+ * Determine the "facing" reference position for an alignment at the split point.
+ * If the alignment covers the LEFT part of the read (earlier query coords),
+ * the breakpoint faces right: ref_end (forward) or ref_start (RC).
+ * If it covers the RIGHT part: ref_start (forward) or ref_end (RC).
+ */
+int facing_ref_pos(const Alignment& aln, bool covers_left_of_read) {
+    if (covers_left_of_read) {
+        return aln.is_revcomp ? aln.ref_start : (aln.ref_start + aln.length);
+    } else {
+        return aln.is_revcomp ? (aln.ref_start + aln.length) : aln.ref_start;
+    }
+}
+
+/*
+ * Compute microhomology by bidirectional reference scan at breakpoint junction.
+ * Returns {forward_matches, backward_matches}.
+ */
+std::pair<int, int> compute_microhomology(
+    const References& references,
+    int left_ref_id, int left_bp,
+    int right_ref_id, int right_bp
+) {
+    const auto& left_seq = references.sequences[left_ref_id];
+    const auto& right_seq = references.sequences[right_ref_id];
+
+    // Forward scan
+    int fwd = 0;
+    int max_fwd = std::min({
+        static_cast<int>(left_seq.size()) - left_bp,
+        static_cast<int>(right_seq.size()) - right_bp,
+        50
+    });
+    for (int i = 0; i < max_fwd; ++i) {
+        char l = std::toupper(left_seq[left_bp + i]);
+        char r = std::toupper(right_seq[right_bp + i]);
+        if (l == 'N' || r == 'N' || l != r) break;
+        fwd++;
+    }
+
+    // Backward scan
+    int bwd = 0;
+    int max_bwd = std::min({left_bp, right_bp, 50});
+    for (int i = 0; i < max_bwd; ++i) {
+        char l = std::toupper(left_seq[left_bp - 1 - i]);
+        char r = std::toupper(right_seq[right_bp - 1 - i]);
+        if (l == 'N' || r == 'N' || l != r) break;
+        bwd++;
+    }
+    return {fwd, bwd};
+}
+
+/*
+ * Detect inserted sequence at the breakpoint junction.
+ * Uses forward-strand query coordinates to find uncovered read bases.
+ */
+std::string compute_inserted_sequence(
+    const Alignment& primary,
+    const Alignment& supp,
+    const std::string& read_seq
+) {
+    // query_start/query_end are already forward-strand coordinates
+    if (primary.query_end <= supp.query_start) {
+        int gap_start = primary.query_end;
+        int gap_end = supp.query_start;
+        if (gap_end > gap_start && gap_end <= static_cast<int>(read_seq.size())) {
+            return read_seq.substr(gap_start, gap_end - gap_start);
+        }
+    } else if (supp.query_end <= primary.query_start) {
+        int gap_start = supp.query_end;
+        int gap_end = primary.query_start;
+        if (gap_end > gap_start && gap_end <= static_cast<int>(read_seq.size())) {
+            return read_seq.substr(gap_start, gap_end - gap_start);
+        }
+    }
+    return "";
+}
+
+/*
+ * Compute confidence interval width for a breakpoint position.
+ * CI = microhomology_total + round(local_repeat_fraction * 10)
+ */
+int compute_ci_width(
+    const References& references,
+    int ref_id, int bp_pos,
+    int microhomology_total
+) {
+    const auto& seq = references.sequences[ref_id];
+    int window = 50;
+    int start = std::max(0, bp_pos - window);
+    int end = std::min(static_cast<int>(seq.size()), bp_pos + window);
+    int total_bases = end - start;
+    if (total_bases <= 0) return microhomology_total;
+
+    // Detect homopolymer runs (>=3bp)
+    int repeat_bases = 0;
+    for (int i = start; i < end; ) {
+        char c = std::toupper(seq[i]);
+        int run = 1;
+        while (i + run < end && std::toupper(seq[i + run]) == c) run++;
+        if (run >= 3) repeat_bases += run;
+        i += run;
+    }
+
+    // Detect dinucleotide repeats (>=6bp = 3 units)
+    for (int i = start; i < end - 5; ) {
+        char c1 = std::toupper(seq[i]);
+        char c2 = std::toupper(seq[i + 1]);
+        if (c1 == c2) { i++; continue; }
+        int run = 2;
+        while (i + run + 1 < end &&
+               std::toupper(seq[i + run]) == c1 &&
+               std::toupper(seq[i + run + 1]) == c2) {
+            run += 2;
+        }
+        if (run >= 6) repeat_bases += run;
+        i += std::max(run, 1);
+    }
+
+    // Cap repeat_bases at total_bases to avoid fraction > 1
+    repeat_bases = std::min(repeat_bases, total_bases);
+    float repeat_frac = static_cast<float>(repeat_bases) / total_bases;
+    int repeat_bonus = std::lround(repeat_frac * 10.0f);
+    return microhomology_total + repeat_bonus;
+}
+
+/*
+ * Compute full breakpoint info for a primary-supplementary pair.
+ */
+BreakpointInfo compute_breakpoint_info(
+    const Alignment& primary,
+    const Alignment& supp,
+    const References& references,
+    const std::string& read_seq
+) {
+    BreakpointInfo bp;
+    bp.sv_type = classify_sv_type(supp, primary);
+
+    // Determine breakpoint positions based on SV type
+    if (bp.sv_type == "DEL") {
+        // Same strand, no overlap — earlier ref_end is left_bp, later ref_start is right_bp
+        if (primary.ref_start <= supp.ref_start) {
+            bp.left_bp = primary.ref_start + primary.length;
+            bp.right_bp = supp.ref_start;
+        } else {
+            bp.left_bp = supp.ref_start + supp.length;
+            bp.right_bp = primary.ref_start;
+        }
+        bp.left_ref_id = bp.right_ref_id = primary.ref_id;
+    } else if (bp.sv_type == "DUP") {
+        // Same strand, overlapping — later ref_start is left_bp, earlier ref_end is right_bp
+        if (primary.ref_start <= supp.ref_start) {
+            bp.left_bp = supp.ref_start;
+            bp.right_bp = primary.ref_start + primary.length;
+        } else {
+            bp.left_bp = primary.ref_start;
+            bp.right_bp = supp.ref_start + supp.length;
+        }
+        bp.left_ref_id = bp.right_ref_id = primary.ref_id;
+    } else {
+        // INV or TRA — use facing-end logic based on query coordinate ordering
+        // The alignment covering the left part of the read provides the "left" breakpoint
+        bool primary_covers_left = (primary.query_start <= supp.query_start);
+        const auto& left_aln = primary_covers_left ? primary : supp;
+        const auto& right_aln = primary_covers_left ? supp : primary;
+
+        bp.left_bp = facing_ref_pos(left_aln, true);
+        bp.right_bp = facing_ref_pos(right_aln, false);
+        bp.left_ref_id = left_aln.ref_id;
+        bp.right_ref_id = right_aln.ref_id;
+    }
+
+    // Bounds check
+    bp.left_bp = std::max(0, std::min(bp.left_bp, static_cast<int>(references.sequences[bp.left_ref_id].size())));
+    bp.right_bp = std::max(0, std::min(bp.right_bp, static_cast<int>(references.sequences[bp.right_ref_id].size())));
+
+    // Microhomology — skip if both breakpoints are at the same position (degenerate INV)
+    if (bp.left_ref_id == bp.right_ref_id && bp.left_bp == bp.right_bp) {
+        bp.mh_fwd = 0;
+        bp.mh_bwd = 0;
+    } else {
+        auto [fwd, bwd] = compute_microhomology(references, bp.left_ref_id, bp.left_bp, bp.right_ref_id, bp.right_bp);
+        bp.mh_fwd = fwd;
+        bp.mh_bwd = bwd;
+    }
+
+    // Inserted sequence
+    bp.inserted_seq = compute_inserted_sequence(primary, supp, read_seq);
+
+    // Confidence intervals
+    int mh_total = bp.mh_fwd + bp.mh_bwd;
+    bp.left_ci = compute_ci_width(references, bp.left_ref_id, bp.left_bp, mh_total);
+    bp.right_ci = compute_ci_width(references, bp.right_ref_id, bp.right_bp, mh_total);
+
+    return bp;
+}
+
+/*
+ * Compute XE: split chain entropy (SE only, --sv-tags).
+ * Boltzmann entropy over alignment scores:
+ *   p_i = exp(score_i / T) / Z,  H = -sum(p_i * log2(p_i))
+ * Low entropy = one dominant alignment = confident. High entropy = ambiguous.
+ * Only meaningful when supplementaries exist (split reads).
+ */
+float compute_split_entropy(const std::vector<Alignment>& alignments) {
+    if (alignments.size() <= 1) return 0.0f;
+    constexpr double T = 10.0;
+    // Find max score for numerical stability
+    int max_score = alignments[0].score;
+    for (const auto& a : alignments) {
+        if (a.score > max_score) max_score = a.score;
+    }
+    // Compute Boltzmann weights
+    double Z = 0.0;
+    std::vector<double> weights;
+    weights.reserve(alignments.size());
+    for (const auto& a : alignments) {
+        double w = std::exp((a.score - max_score) / T);
+        weights.push_back(w);
+        Z += w;
+    }
+    // Compute entropy
+    double H = 0.0;
+    for (double w : weights) {
+        double p = w / Z;
+        if (p > 0.0) {
+            H -= p * std::log2(p);
+        }
+    }
+    return static_cast<float>(H);
+}
+
+/*
+ * Compute XF: maximum artifact probability across supplementary alignments.
+ * Heuristic score (0.0-1.0) based on:
+ *   - Supplementary aligned length as fraction of read length (short = suspicious)
+ *   - Supplementary score as fraction of primary score (low = suspicious)
+ * XF = max over supplementaries of: 1.0 - (len_frac * score_frac)
+ * High XF = likely artifact. Low XF = confident split.
+ */
+float compute_max_artifact_prob(
+    const Alignment& primary,
+    const std::vector<Alignment>& supplementaries,
+    int read_length
+) {
+    if (supplementaries.empty() || primary.score <= 0 || read_length <= 0) return 0.0f;
+    float max_prob = 0.0f;
+    for (const auto& s : supplementaries) {
+        float len_frac = static_cast<float>(s.query_end - s.query_start) / read_length;
+        float score_frac = static_cast<float>(s.score) / primary.score;
+        // Clamp to [0, 1]
+        len_frac = std::min(1.0f, std::max(0.0f, len_frac));
+        score_frac = std::min(1.0f, std::max(0.0f, score_frac));
+        float artifact = 1.0f - (len_frac * score_frac);
+        if (artifact > max_prob) max_prob = artifact;
+    }
+    return max_prob;
 }
 
 /*
@@ -420,12 +742,47 @@ inline void align_single(
     // Build extra_tags for primary: SA + XD/XR + XA
     std::string extra_tags = primary_sa_tag;
 
-    // XD/XR: score delta/ratio vs best supplementary (--sv-tags only)
+    // SV tags: XD/XR/XE/XF + YS + breakpoint tags (--sv-tags only)
+    std::vector<BreakpointInfo> bp_infos;
     if (sv_tags && !supplementaries.empty()) {
         auto dt = compute_supp_delta_tags(best_alignment, supplementaries);
         if (!dt.empty()) {
             if (!extra_tags.empty()) extra_tags += '\t';
             extra_tags += dt;
+        }
+        // XE: split chain entropy over all alignments
+        {
+            char buf[32];
+            float xe = compute_split_entropy(alignments);
+            std::snprintf(buf, sizeof(buf), "XE:f:%.3f", xe);
+            if (!extra_tags.empty()) extra_tags += '\t';
+            extra_tags += buf;
+        }
+        // XF: max artifact probability across supplementaries
+        {
+            char buf[32];
+            float xf = compute_max_artifact_prob(best_alignment, supplementaries, record.seq.length());
+            std::snprintf(buf, sizeof(buf), "XF:f:%.2f", xf);
+            if (!extra_tags.empty()) extra_tags += '\t';
+            extra_tags += buf;
+        }
+        // Compute breakpoint info for each supplementary
+        for (const auto& s : supplementaries) {
+            bp_infos.push_back(compute_breakpoint_info(best_alignment, s, references, record.seq));
+        }
+        // YS: comma-separated SV types on primary
+        {
+            if (!extra_tags.empty()) extra_tags += '\t';
+            extra_tags += "YS:Z:";
+            for (size_t i = 0; i < bp_infos.size(); ++i) {
+                if (i > 0) extra_tags += ',';
+                extra_tags += bp_infos[i].sv_type;
+            }
+        }
+        // Breakpoint tags from best supplementary on primary
+        if (!bp_infos.empty()) {
+            extra_tags += '\t';
+            extra_tags += bp_infos[0].format_all(references);
         }
     }
 
@@ -467,7 +824,14 @@ inline void align_single(
 
     // Output supplementary alignments
     for (size_t i = 0; i < supplementaries.size(); ++i) {
-        sam.add(supplementaries[i], record, read.rc, mapq, SUPPLEMENTARY_ALN, details, supp_sa_tags[i]);
+        std::string supp_extra = supp_sa_tags[i];
+        if (sv_tags && i < bp_infos.size()) {
+            if (!supp_extra.empty()) supp_extra += '\t';
+            supp_extra += "YS:Z:" + bp_infos[i].sv_type;
+            supp_extra += '\t';
+            supp_extra += bp_infos[i].format_all(references);
+        }
+        sam.add(supplementaries[i], record, read.rc, mapq, SUPPLEMENTARY_ALN, details, supp_extra);
     }
 
     if (max_secondary == 0 || alignments.empty()) {
@@ -1504,6 +1868,7 @@ std::vector<Nam> get_nams_or_chains(
     Timer strobe_timer;
     auto query_randstrobes = randstrobes_query(record.seq, index_parameters);
     statistics.n_randstrobes += query_randstrobes[0].size() + query_randstrobes[1].size();
+    details.n_seeds = query_randstrobes[0].size() + query_randstrobes[1].size();
     statistics.tot_construct_strobemers += strobe_timer.duration();
 
     std::vector<Nam> nams;
@@ -1565,6 +1930,7 @@ void align_or_map_paired(
             details[is_r1].s1 = std::lroundf(nams_pair[is_r1][0].score);
             if (nams_pair[is_r1].size() > 1) details[is_r1].s2 = std::lroundf(nams_pair[is_r1][1].score);
             details[is_r1].cm = nams_pair[is_r1][0].n_matches;
+            details[is_r1].xc = std::lroundf(nams_pair[is_r1][0].score);
         }
     }
 
@@ -1646,7 +2012,8 @@ void align_or_map_paired(
                     if (!extra2.empty()) extra2 += '\t';
                     extra2 += sv_extra2;
                 }
-                // XD/XR: supplementary score delta/ratio
+                // XD/XR + breakpoint tags
+                std::vector<BreakpointInfo> bp_infos1, bp_infos2;
                 if (map_param.sv_tags) {
                     if (!si1.supps.empty()) {
                         auto dt = compute_supp_delta_tags(alignment1, si1.supps);
@@ -1654,12 +2021,40 @@ void align_or_map_paired(
                             if (!extra1.empty()) extra1 += '\t';
                             extra1 += dt;
                         }
+                        for (const auto& s : si1.supps) {
+                            bp_infos1.push_back(compute_breakpoint_info(alignment1, s, references, record1.seq));
+                        }
+                        if (!bp_infos1.empty()) {
+                            // YS on primary: comma-separated SV types
+                            if (!extra1.empty()) extra1 += '\t';
+                            extra1 += "YS:Z:";
+                            for (size_t j = 0; j < bp_infos1.size(); ++j) {
+                                if (j > 0) extra1 += ',';
+                                extra1 += bp_infos1[j].sv_type;
+                            }
+                            extra1 += '\t';
+                            extra1 += bp_infos1[0].format_all(references);
+                        }
                     }
                     if (!si2.supps.empty()) {
                         auto dt = compute_supp_delta_tags(alignment2, si2.supps);
                         if (!dt.empty()) {
                             if (!extra2.empty()) extra2 += '\t';
                             extra2 += dt;
+                        }
+                        for (const auto& s : si2.supps) {
+                            bp_infos2.push_back(compute_breakpoint_info(alignment2, s, references, record2.seq));
+                        }
+                        if (!bp_infos2.empty()) {
+                            // YS on primary: comma-separated SV types
+                            if (!extra2.empty()) extra2 += '\t';
+                            extra2 += "YS:Z:";
+                            for (size_t j = 0; j < bp_infos2.size(); ++j) {
+                                if (j > 0) extra2 += ',';
+                                extra2 += bp_infos2[j].sv_type;
+                            }
+                            extra2 += '\t';
+                            extra2 += bp_infos2[0].format_all(references);
                         }
                     }
                 }
@@ -1671,6 +2066,10 @@ void align_or_map_paired(
                     if (map_param.sv_tags) {
                         if (!supp_extra.empty()) supp_extra += '\t';
                         supp_extra += compute_ys_tag(si1.supps[j], alignment1);
+                        if (j < bp_infos1.size()) {
+                            supp_extra += '\t';
+                            supp_extra += bp_infos1[j].format_all(references);
+                        }
                     }
                     sam.add_paired_supplementary(si1.supps[j], record1, read1.rc, mapq1, true, alignment2, mapq2, details[0], supp_extra);
                 }
@@ -1679,6 +2078,10 @@ void align_or_map_paired(
                     if (map_param.sv_tags) {
                         if (!supp_extra.empty()) supp_extra += '\t';
                         supp_extra += compute_ys_tag(si2.supps[j], alignment2);
+                        if (j < bp_infos2.size()) {
+                            supp_extra += '\t';
+                            supp_extra += bp_infos2[j].format_all(references);
+                        }
                     }
                     sam.add_paired_supplementary(si2.supps[j], record2, read2.rc, mapq2, false, alignment1, mapq1, details[1], supp_extra);
                 }
@@ -1766,7 +2169,8 @@ void align_or_map_paired(
                     if (!extra2.empty()) extra2 += '\t';
                     extra2 += sv_extra2;
                 }
-                // XD/XR: supplementary score delta/ratio
+                // XD/XR + breakpoint tags
+                std::vector<BreakpointInfo> bp_infos1, bp_infos2;
                 if (map_param.sv_tags) {
                     if (!si1.supps.empty()) {
                         auto dt = compute_supp_delta_tags(primary1, si1.supps);
@@ -1774,12 +2178,40 @@ void align_or_map_paired(
                             if (!extra1.empty()) extra1 += '\t';
                             extra1 += dt;
                         }
+                        for (const auto& s : si1.supps) {
+                            bp_infos1.push_back(compute_breakpoint_info(primary1, s, references, record1.seq));
+                        }
+                        if (!bp_infos1.empty()) {
+                            // YS on primary: comma-separated SV types
+                            if (!extra1.empty()) extra1 += '\t';
+                            extra1 += "YS:Z:";
+                            for (size_t j = 0; j < bp_infos1.size(); ++j) {
+                                if (j > 0) extra1 += ',';
+                                extra1 += bp_infos1[j].sv_type;
+                            }
+                            extra1 += '\t';
+                            extra1 += bp_infos1[0].format_all(references);
+                        }
                     }
                     if (!si2.supps.empty()) {
                         auto dt = compute_supp_delta_tags(primary2, si2.supps);
                         if (!dt.empty()) {
                             if (!extra2.empty()) extra2 += '\t';
                             extra2 += dt;
+                        }
+                        for (const auto& s : si2.supps) {
+                            bp_infos2.push_back(compute_breakpoint_info(primary2, s, references, record2.seq));
+                        }
+                        if (!bp_infos2.empty()) {
+                            // YS on primary: comma-separated SV types
+                            if (!extra2.empty()) extra2 += '\t';
+                            extra2 += "YS:Z:";
+                            for (size_t j = 0; j < bp_infos2.size(); ++j) {
+                                if (j > 0) extra2 += ',';
+                                extra2 += bp_infos2[j].sv_type;
+                            }
+                            extra2 += '\t';
+                            extra2 += bp_infos2[0].format_all(references);
                         }
                     }
                 }
@@ -1793,6 +2225,10 @@ void align_or_map_paired(
                     if (map_param.sv_tags) {
                         if (!supp_extra.empty()) supp_extra += '\t';
                         supp_extra += compute_ys_tag(si1.supps[j], primary1);
+                        if (j < bp_infos1.size()) {
+                            supp_extra += '\t';
+                            supp_extra += bp_infos1[j].format_all(references);
+                        }
                     }
                     sam.add_paired_supplementary(si1.supps[j], record1, read1.rc, mapq1, true, primary2, mapq2, details[0], supp_extra);
                 }
@@ -1801,6 +2237,10 @@ void align_or_map_paired(
                     if (map_param.sv_tags) {
                         if (!supp_extra.empty()) supp_extra += '\t';
                         supp_extra += compute_ys_tag(si2.supps[j], primary2);
+                        if (j < bp_infos2.size()) {
+                            supp_extra += '\t';
+                            supp_extra += bp_infos2[j].format_all(references);
+                        }
                     }
                     sam.add_paired_supplementary(si2.supps[j], record2, read2.rc, mapq2, false, primary1, mapq1, details[1], supp_extra);
                 }
@@ -1862,6 +2302,7 @@ void align_or_map_single(
         details.s1 = std::lroundf(nams[0].score);
         if (nams.size() > 1) details.s2 = std::lroundf(nams[1].score);
         details.cm = nams[0].n_matches;
+        details.xc = std::lroundf(nams[0].score);
     }
 
     Timer extend_timer;
