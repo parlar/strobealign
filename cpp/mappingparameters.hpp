@@ -1,6 +1,7 @@
 #ifndef STROBEALIGN_MAPPINGPARAMETERS_HPP
 #define STROBEALIGN_MAPPINGPARAMETERS_HPP
 
+#include <algorithm>
 #include "mcsstrategy.hpp"
 #include "sam.hpp"
 #include "exceptions.hpp"
@@ -55,5 +56,13 @@ struct MappingParameters {
         }
     }
 };
+
+inline MappingParameters make_relaxed_params(const MappingParameters& base) {
+    MappingParameters relaxed = base;
+    relaxed.min_clip = std::max(base.min_clip / 2, 5);
+    relaxed.max_tries = std::min(base.max_tries * 2, 50);
+    relaxed.dropoff_threshold = std::max(base.dropoff_threshold - 0.2f, 0.2f);
+    return relaxed;
+}
 
 #endif

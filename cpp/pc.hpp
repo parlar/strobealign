@@ -14,6 +14,7 @@
 #include "fastq.hpp"
 #include "mappingparameters.hpp"
 #include "aligner.hpp"
+#include "svhotspot.hpp"
 
 class InputBuffer {
 
@@ -64,6 +65,8 @@ public:
 
     size_t get_max_entries() const { return max_entries; }
 
+    bool suppress_output{false};
+
 private:
     size_t max_entries{0};
 };
@@ -72,7 +75,10 @@ private:
 void perform_task(InputBuffer &input_buffer, OutputBuffer &output_buffer,
                   AlignmentStatistics& statistics, int& done, const AlignmentParameters &aln_params,
                   const MappingParameters &map_param, const IndexParameters& index_parameters,
-                  const References& references, const StrobemerIndex& index, const std::string& read_group_id, std::vector<double> &abundances);
+                  const References& references, const StrobemerIndex& index, const std::string& read_group_id, std::vector<double> &abundances,
+                  SvEvidenceCollector* collector = nullptr,
+                  const HotspotMap* hotspot_map = nullptr,
+                  const MappingParameters* relaxed_params = nullptr);
 
 bool same_name(const std::string& n1, const std::string& n2);
 

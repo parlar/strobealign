@@ -36,6 +36,7 @@ struct CommandLineOptions {
     int max_supp_overlap { 50 };
     int min_clip { 15 };
     bool sv_tags { false };
+    bool two_pass { false };
 
     // Seeding
     int r { 150 };

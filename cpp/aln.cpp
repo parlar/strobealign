@@ -620,7 +620,9 @@ inline void align_single(
     unsigned max_supplementary,
     int max_supp_overlap,
     std::minstd_rand& random_engine,
-    bool sv_tags = false
+    bool sv_tags = false,
+    SvEvidenceCollector* collector = nullptr,
+    bool is_near_hotspot = false
 ) {
     if (nams.empty()) {
         sam.add_unmapped(record);
@@ -742,9 +744,17 @@ inline void align_single(
     // Build extra_tags for primary: SA + XD/XR + XA
     std::string extra_tags = primary_sa_tag;
 
-    // SV tags: XD/XR/XE/XF + YS + breakpoint tags (--sv-tags only)
+    // Collect SV evidence for two-pass (pass 1) — cheap position extraction
+    if (collector && !supplementaries.empty()) {
+        for (const auto& s : supplementaries) {
+            collector->add(best_alignment.ref_id, best_alignment.ref_start + best_alignment.length);
+            collector->add(s.ref_id, s.ref_start);
+        }
+    }
+
+    // SV tags: XD/XR/XE/XF + YS + breakpoint tags (--sv-tags only, skip in pass 1)
     std::vector<BreakpointInfo> bp_infos;
-    if (sv_tags && !supplementaries.empty()) {
+    if (sv_tags && !supplementaries.empty() && !collector) {
         auto dt = compute_supp_delta_tags(best_alignment, supplementaries);
         if (!dt.empty()) {
             if (!extra_tags.empty()) extra_tags += '\t';
@@ -784,6 +794,12 @@ inline void align_single(
             extra_tags += '\t';
             extra_tags += bp_infos[0].format_all(references);
         }
+    }
+
+    // Tag hotspot-realigned reads
+    if (is_near_hotspot) {
+        if (!extra_tags.empty()) extra_tags += '\t';
+        extra_tags += "XH:i:1";
     }
 
     // XA: alternative alignment locations (all non-primary, non-supplementary, deduplicated)
@@ -1916,7 +1932,10 @@ void align_or_map_paired(
     const References& references,
     const StrobemerIndex& index,
     std::minstd_rand& random_engine,
-    std::vector<double> &abundances
+    std::vector<double> &abundances,
+    SvEvidenceCollector* collector,
+    const HotspotMap* hotspot_map,
+    const MappingParameters* relaxed_params
 ) {
     std::array<Details, 2> details;
     std::array<std::vector<Nam>, 2> nams_pair;
@@ -1934,6 +1953,18 @@ void align_or_map_paired(
             details[is_r1].xc = std::lroundf(nams_pair[is_r1][0].score);
         }
     }
+
+    // Two-pass: check if either read's top NAM is near an SV hotspot
+    bool is_near_hotspot = false;
+    if (hotspot_map) {
+        for (const auto& nams : nams_pair) {
+            if (!nams.empty() && hotspot_map->near_hotspot(nams[0].ref_id, nams[0].ref_start)) {
+                is_near_hotspot = true;
+                break;
+            }
+        }
+    }
+    const auto& effective_params = (is_near_hotspot && relaxed_params) ? *relaxed_params : map_param;
 
     Timer extend_timer;
     if (map_param.output_format != OutputFormat::SAM) { // PAF or abundance
@@ -1962,8 +1993,8 @@ void align_or_map_paired(
         auto alignment_pairs = align_paired(
             aligner, nams_pair[0], nams_pair[1], read1, read2,
             index_parameters.syncmer.k, references, details,
-            map_param.dropoff_threshold, isize_est,
-            map_param.max_tries
+            effective_params.dropoff_threshold, isize_est,
+            effective_params.max_tries
         );
 
         // -1 marks the typical case that both reads map uniquely and form a
@@ -1990,17 +2021,17 @@ void align_or_map_paired(
             details[0].best_alignments = 1;
             details[1].best_alignments = 1;
 
-            // Build SV extra tags if requested
+            // Build SV extra tags if requested (skip in pass 1 — output is suppressed)
             std::string sv_extra1, sv_extra2;
-            if (map_param.sv_tags) {
+            if (map_param.sv_tags && !collector) {
                 sv_extra1 = build_sv_tags(alignment1, alignment2, isize_est.mu, isize_est.sigma, details[0], true);
                 sv_extra2 = build_sv_tags(alignment1, alignment2, isize_est.mu, isize_est.sigma, details[1], true);
             }
 
-            if (map_param.max_supplementary > 0) {
+            if (effective_params.max_supplementary > 0) {
                 auto k = index_parameters.syncmer.k;
-                auto si1 = build_supplementary_info(sam, aligner, nams_pair[0], read1, alignment1, mapq1, k, references, map_param.dropoff_threshold, map_param.max_tries, map_param.max_supplementary, map_param.max_supp_overlap, map_param.min_clip);
-                auto si2 = build_supplementary_info(sam, aligner, nams_pair[1], read2, alignment2, mapq2, k, references, map_param.dropoff_threshold, map_param.max_tries, map_param.max_supplementary, map_param.max_supp_overlap, map_param.min_clip);
+                auto si1 = build_supplementary_info(sam, aligner, nams_pair[0], read1, alignment1, mapq1, k, references, effective_params.dropoff_threshold, effective_params.max_tries, effective_params.max_supplementary, effective_params.max_supp_overlap, effective_params.min_clip);
+                auto si2 = build_supplementary_info(sam, aligner, nams_pair[1], read2, alignment2, mapq2, k, references, effective_params.dropoff_threshold, effective_params.max_tries, effective_params.max_supplementary, effective_params.max_supp_overlap, effective_params.min_clip);
 
                 // Combine SA tags with SV tags
                 std::string extra1 = si1.primary_sa_tag;
@@ -2013,9 +2044,28 @@ void align_or_map_paired(
                     if (!extra2.empty()) extra2 += '\t';
                     extra2 += sv_extra2;
                 }
-                // XD/XR + breakpoint tags
+                // Collect SV evidence for two-pass (pass 1) — use cheap position
+                // extraction from supplementary alignments, skip expensive breakpoint
+                // computation (microhomology, CI width, formatting)
+                if (collector) {
+                    for (const auto& s : si1.supps) {
+                        collector->add(alignment1.ref_id, alignment1.ref_start + alignment1.length);
+                        collector->add(s.ref_id, s.ref_start);
+                    }
+                    for (const auto& s : si2.supps) {
+                        collector->add(alignment2.ref_id, alignment2.ref_start + alignment2.length);
+                        collector->add(s.ref_id, s.ref_start);
+                    }
+                    if (!is_proper && !alignment1.is_unaligned && !alignment2.is_unaligned
+                        && isize_est.sample_size >= 100) {
+                        collector->add(alignment1.ref_id, alignment1.ref_start);
+                        collector->add(alignment2.ref_id, alignment2.ref_start);
+                    }
+                }
+
+                // XD/XR + breakpoint tags (pass 2 / normal mode only)
                 std::vector<BreakpointInfo> bp_infos1, bp_infos2;
-                if (map_param.sv_tags) {
+                if (map_param.sv_tags && !collector) {
                     if (!si1.supps.empty()) {
                         auto dt = compute_supp_delta_tags(alignment1, si1.supps);
                         if (!dt.empty()) {
@@ -2058,6 +2108,14 @@ void align_or_map_paired(
                             extra2 += bp_infos2[0].format_all(references);
                         }
                     }
+                }
+
+                // Tag hotspot-realigned reads
+                if (is_near_hotspot) {
+                    if (!extra1.empty()) extra1 += '\t';
+                    extra1 += "XH:i:1";
+                    if (!extra2.empty()) extra2 += '\t';
+                    extra2 += "XH:i:1";
                 }
 
                 sam.add_pair(alignment1, alignment2, record1, record2, read1.rc, read2.rc, mapq1, mapq2, is_proper, PRIMARY, details, extra1, extra2);
@@ -2117,7 +2175,7 @@ void align_or_map_paired(
                 details[1].yj = posterior;
             }
 
-            if (map_param.max_supplementary > 0 && !alignment_pairs.empty()) {
+            if (effective_params.max_supplementary > 0 && !alignment_pairs.empty()) {
                 // Detect supplementaries for each read, then output
                 // primary pair with SA tags, supplementaries, and secondaries
                 auto [mapq1, mapq2] = joint_mapq_from_high_scores(alignment_pairs);
@@ -2147,12 +2205,12 @@ void align_or_map_paired(
                     }
                 }
 
-                auto si1 = build_supplementary_info_from_candidates(sam, candidates1, primary1, mapq1, map_param.max_supplementary, map_param.max_supp_overlap, record1.seq.length(), map_param.min_clip);
-                auto si2 = build_supplementary_info_from_candidates(sam, candidates2, primary2, mapq2, map_param.max_supplementary, map_param.max_supp_overlap, record2.seq.length(), map_param.min_clip);
+                auto si1 = build_supplementary_info_from_candidates(sam, candidates1, primary1, mapq1, effective_params.max_supplementary, effective_params.max_supp_overlap, record1.seq.length(), effective_params.min_clip);
+                auto si2 = build_supplementary_info_from_candidates(sam, candidates2, primary2, mapq2, effective_params.max_supplementary, effective_params.max_supp_overlap, record2.seq.length(), effective_params.min_clip);
 
-                // Build SV extra tags if requested
+                // Build SV extra tags if requested (skip in pass 1 — output is suppressed)
                 std::string sv_extra1, sv_extra2;
-                if (map_param.sv_tags) {
+                if (map_param.sv_tags && !collector) {
                     sv_extra1 = build_sv_tags(primary1, primary2, isize_est.mu, isize_est.sigma, details[0], false);
                     sv_extra2 = build_sv_tags(primary1, primary2, isize_est.mu, isize_est.sigma, details[1], false);
                 }
@@ -2168,9 +2226,26 @@ void align_or_map_paired(
                     if (!extra2.empty()) extra2 += '\t';
                     extra2 += sv_extra2;
                 }
-                // XD/XR + breakpoint tags
+                // Collect SV evidence for two-pass (pass 1) — cheap position extraction
+                if (collector) {
+                    for (const auto& s : si1.supps) {
+                        collector->add(primary1.ref_id, primary1.ref_start + primary1.length);
+                        collector->add(s.ref_id, s.ref_start);
+                    }
+                    for (const auto& s : si2.supps) {
+                        collector->add(primary2.ref_id, primary2.ref_start + primary2.length);
+                        collector->add(s.ref_id, s.ref_start);
+                    }
+                    if (!is_proper && !primary1.is_unaligned && !primary2.is_unaligned
+                        && isize_est.sample_size >= 100) {
+                        collector->add(primary1.ref_id, primary1.ref_start);
+                        collector->add(primary2.ref_id, primary2.ref_start);
+                    }
+                }
+
+                // XD/XR + breakpoint tags (pass 2 / normal mode only)
                 std::vector<BreakpointInfo> bp_infos1, bp_infos2;
-                if (map_param.sv_tags) {
+                if (map_param.sv_tags && !collector) {
                     if (!si1.supps.empty()) {
                         auto dt = compute_supp_delta_tags(primary1, si1.supps);
                         if (!dt.empty()) {
@@ -2213,6 +2288,14 @@ void align_or_map_paired(
                             extra2 += bp_infos2[0].format_all(references);
                         }
                     }
+                }
+
+                // Tag hotspot-realigned reads
+                if (is_near_hotspot) {
+                    if (!extra1.empty()) extra1 += '\t';
+                    extra1 += "XH:i:1";
+                    if (!extra2.empty()) extra2 += '\t';
+                    extra2 += "XH:i:1";
                 }
 
                 // Output primary pair with SA + SV tags
@@ -2290,7 +2373,10 @@ void align_or_map_single(
     const References& references,
     const StrobemerIndex& index,
     std::minstd_rand& random_engine,
-    std::vector<double> &abundances
+    std::vector<double> &abundances,
+    SvEvidenceCollector* collector,
+    const HotspotMap* hotspot_map,
+    const MappingParameters* relaxed_params
 ) {
     Details details;
     std::vector<Nam> nams;
@@ -2334,14 +2420,22 @@ void align_or_map_single(
             output_hits_paf(outstring, nams, record.name, references, record.seq.length(), mapq);
             break;
         }
-        case OutputFormat::SAM:
+        case OutputFormat::SAM: {
+            // Two-pass: check if read's top NAM is near an SV hotspot
+            bool se_near_hotspot = false;
+            if (hotspot_map && !nams.empty()) {
+                se_near_hotspot = hotspot_map->near_hotspot(nams[0].ref_id, nams[0].ref_start);
+            }
+            const auto& se_params = (se_near_hotspot && relaxed_params) ? *relaxed_params : map_param;
             align_single(
                 aligner, sam, nams, record, index_parameters.syncmer.k,
-                references, details, map_param.dropoff_threshold, map_param.max_tries,
-                map_param.max_secondary, map_param.max_supplementary,
-                map_param.max_supp_overlap, random_engine, map_param.sv_tags
+                references, details, se_params.dropoff_threshold, se_params.max_tries,
+                se_params.max_secondary, se_params.max_supplementary,
+                se_params.max_supp_overlap, random_engine, se_params.sv_tags,
+                collector, se_near_hotspot
             );
             break;
+        }
     }
     statistics.tot_extend += extend_timer.duration();
     statistics += details;

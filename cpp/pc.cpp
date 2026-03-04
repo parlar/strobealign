@@ -112,6 +112,8 @@ void InputBuffer::rewind_reset() {
 }
 
 void OutputBuffer::output_records(std::string chunk, size_t chunk_index) {
+    if (suppress_output) return;
+
     std::unique_lock<std::mutex> unique_lock(mtx);
 
     max_entries = std::max(chunks.size(), max_entries);
@@ -142,7 +144,10 @@ void perform_task(
     const References& references,
     const StrobemerIndex& index,
     const std::string& read_group_id,
-    std::vector<double> &abundances
+    std::vector<double> &abundances,
+    SvEvidenceCollector* collector,
+    const HotspotMap* hotspot_map,
+    const MappingParameters* relaxed_params
 ) {
     Aligner aligner{aln_params};
     Chainer chainer{map_param.chaining_params, index.k()};
@@ -163,7 +168,8 @@ void perform_task(
 
         std::string sam_out;
         sam_out.reserve(7*map_param.r * (records1.size() + records3.size()));
-        Sam sam{sam_out, references, map_param.cigar_ops, read_group_id, map_param.output_unmapped, map_param.details, map_param.fastq_comments};
+        bool suppress_sam = (collector != nullptr);  // Pass 1: skip SAM string building
+        Sam sam{sam_out, references, map_param.cigar_ops, read_group_id, map_param.output_unmapped, map_param.details, map_param.fastq_comments, suppress_sam};
         InsertSizeDistribution isize_est;
         // Use chunk index as random seed for reproducibility
         random_engine.seed(chunk_index);
@@ -173,12 +179,14 @@ void perform_task(
             to_uppercase(record1.seq);
             to_uppercase(record2.seq);
             align_or_map_paired(record1, record2, sam, sam_out, statistics, isize_est, aligner,
-                        chainer, map_param, index_parameters, references, index, random_engine, abundances);
+                        chainer, map_param, index_parameters, references, index, random_engine, abundances,
+                        collector, hotspot_map, relaxed_params);
             statistics.n_reads += 2;
         }
         for (size_t i = 0; i < records3.size(); ++i) {
             auto record = records3[i];
-            align_or_map_single(record, sam, sam_out, statistics, aligner, chainer, map_param, index_parameters, references, index, random_engine, abundances);
+            align_or_map_single(record, sam, sam_out, statistics, aligner, chainer, map_param, index_parameters, references, index, random_engine, abundances,
+                        collector, hotspot_map, relaxed_params);
             statistics.n_reads++;
         }
 

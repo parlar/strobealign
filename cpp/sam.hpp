@@ -64,7 +64,8 @@ public:
         const std::string& read_group_id = "",
         bool output_unmapped = true,
         bool show_details = false,
-        bool fastq_comments = false
+        bool fastq_comments = false,
+        bool suppress = false
     )
         : sam_string(sam_string)
         , references(references)
@@ -72,6 +73,7 @@ public:
         , output_unmapped(output_unmapped)
         , show_details(show_details)
         , fastq_comments(fastq_comments)
+        , suppress(suppress)
     {
             if (read_group_id.empty()) {
                 tail = "";
@@ -135,6 +137,7 @@ private:
     bool output_unmapped;
     bool show_details;
     bool fastq_comments;
+    bool suppress;
 };
 
 bool is_proper_pair(const Alignment& alignment1, const Alignment& alignment2, float mu, float sigma);

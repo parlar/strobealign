@@ -77,7 +77,7 @@ std::string Sam::cigar_string(const Cigar& cigar) const {
 }
 
 void Sam::add_unmapped(const KSeq& record, uint16_t flags) {
-    if (!output_unmapped) {
+    if (suppress || !output_unmapped) {
         return;
     }
     assert((flags & ~(UNMAP|PAIRED|MUNMAP|READ1|READ2)) == 0);
@@ -97,6 +97,7 @@ void Sam::add_unmapped(const KSeq& record, uint16_t flags) {
 }
 
 void Sam::add_unmapped_mate(const KSeq& record, uint16_t flags, const std::string& mate_reference_name, uint32_t mate_pos) {
+    if (suppress) return;
     assert((flags & UNMAP) && (flags & PAIRED));
     sam_string.append(strip_suffix(record.name));
     sam_string.append("\t");
@@ -138,6 +139,7 @@ void Sam::add(
     const Details& details,
     const std::string& extra_tags
 ) {
+    if (suppress) return;
     assert(!alignment.is_unaligned);
 
     int flags = 0;
@@ -318,6 +320,7 @@ void Sam::add_pair(
     const std::string& extra_tags1,
     const std::string& extra_tags2
 ) {
+    if (suppress) return;
     int f1 = PAIRED | READ1;
     int f2 = PAIRED | READ2;
     if (aln_type == SECONDARY_ALN) {
@@ -607,6 +610,7 @@ void Sam::add_paired_supplementary(
     const Details& details,
     const std::string& extra_tags
 ) {
+    if (suppress) return;
     assert(!alignment.is_unaligned);
 
     int flags = SUPPLEMENTARY | PAIRED;

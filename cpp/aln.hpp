@@ -15,6 +15,7 @@
 #include "statistics.hpp"
 #include "nam.hpp"
 #include "mappingparameters.hpp"
+#include "svhotspot.hpp"
 
 void align_or_map_paired(
     const klibpp::KSeq& record1,
@@ -30,7 +31,10 @@ void align_or_map_paired(
     const References& references,
     const StrobemerIndex& index,
     std::minstd_rand& random_engine,
-    std::vector<double> &abundances
+    std::vector<double> &abundances,
+    SvEvidenceCollector* collector = nullptr,
+    const HotspotMap* hotspot_map = nullptr,
+    const MappingParameters* relaxed_params = nullptr
 );
 
 void align_or_map_single(
@@ -45,7 +49,10 @@ void align_or_map_single(
     const References& references,
     const StrobemerIndex& index,
     std::minstd_rand& random_engine,
-    std::vector<double> &abundances
+    std::vector<double> &abundances,
+    SvEvidenceCollector* collector = nullptr,
+    const HotspotMap* hotspot_map = nullptr,
+    const MappingParameters* relaxed_params = nullptr
 );
 
 // Private declarations, only needed for tests

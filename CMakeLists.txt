@@ -67,6 +67,7 @@ add_library(salib STATIC ${SOURCES}
   cpp/readlen.cpp
   cpp/version.cpp
   cpp/io.cpp
+  cpp/svhotspot.cpp
   cpp/insertsizedistribution.cpp
   cpp/iowrap.cpp
   cpp/chain.cpp

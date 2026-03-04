@@ -19,6 +19,7 @@
 #include "cmdline.hpp"
 #include "index.hpp"
 #include "pc.hpp"
+#include "svhotspot.hpp"
 #include "logger.hpp"
 #include "timer.hpp"
 #include "readlen.hpp"
@@ -100,7 +101,7 @@ void show_progress_until_done(std::vector<int>& worker_done, std::vector<Alignme
     bool reported = false;
     bool done = false;
     // Waiting time between progress updates
-    // Start with a small value so that there’s no delay if there are very few
+    // Start with a small value so that there's no delay if there are very few
     // reads to align.
     auto time_to_wait = std::chrono::milliseconds(1);
     while (!done) {
@@ -351,24 +352,105 @@ int run_strobealign(int argc, char **argv) {
     logger.info() << "using " << opt.n_threads << " thread" << (opt.n_threads != 1 ? "s" : "") << std::endl;
 
     OutputBuffer output_buffer(out);
-    std::vector<std::thread> workers;
-    std::vector<int> worker_done(opt.n_threads);  // each thread sets its entry to 1 when it’s done
+
+    // Two-pass SV-hotspot realignment support
+    HotspotMap hotspot_map;
+    MappingParameters relaxed_map_param;
+    bool do_two_pass = opt.two_pass;
     std::vector<std::vector<double>> worker_abundances(opt.n_threads, std::vector<double>(references.size(), 0));
-    for (int i = 0; i < opt.n_threads; ++i) {
-        std::thread consumer(perform_task, std::ref(input_buffer), std::ref(output_buffer),
-            std::ref(worker_statistics[i]), std::ref(worker_done[i]), std::ref(aln_params),
-            std::ref(map_param), std::ref(index_parameters), std::ref(references),
-            std::ref(index), std::ref(opt.read_group_id), std::ref(worker_abundances[i]));
-        workers.push_back(std::move(consumer));
+
+    if (do_two_pass) {
+        // ---- Pass 1: Collect SV evidence, suppress output ----
+        Timer pass1_timer;
+        logger.info() << "Pass 1: Collecting SV evidence...\n";
+        output_buffer.suppress_output = true;
+        std::vector<SvEvidenceCollector> collectors(opt.n_threads);
+        std::vector<std::thread> workers;
+        std::vector<int> worker_done(opt.n_threads);
+        for (int i = 0; i < opt.n_threads; ++i) {
+            std::thread consumer(perform_task, std::ref(input_buffer), std::ref(output_buffer),
+                std::ref(worker_statistics[i]), std::ref(worker_done[i]), std::ref(aln_params),
+                std::ref(map_param), std::ref(index_parameters), std::ref(references),
+                std::ref(index), std::ref(opt.read_group_id), std::ref(worker_abundances[i]),
+                &collectors[i], nullptr, nullptr);
+            workers.push_back(std::move(consumer));
+        }
+        if (opt.show_progress && isatty(2)) {
+            show_progress_until_done(worker_done, worker_statistics);
+        }
+        for (auto& worker : workers) {
+            worker.join();
+        }
+        logger.info() << "Pass 1 done in " << pass1_timer.elapsed() << " s.\n";
+
+        // ---- Build hotspot map from merged evidence ----
+        std::vector<SvEvidence> all_evidence;
+        for (auto& c : collectors) {
+            all_evidence.insert(all_evidence.end(), c.evidence.begin(), c.evidence.end());
+        }
+        hotspot_map.build(all_evidence, references.size());
+        logger.info() << "Found " << hotspot_map.total_hotspots() << " SV hotspot regions from "
+                      << all_evidence.size() << " evidence items\n";
+
+        // ---- Pass 2: Realign with hotspot awareness ----
+        Timer pass2_timer;
+        logger.info() << "Pass 2: Realigning reads near hotspots...\n";
+        // Create a fresh InputBuffer since files can only be rewound once
+        InputBuffer input_buffer2 = get_input_buffer(opt);
+        input_buffer2.set_chunk_size(std::clamp(opt.chunk_size / opt.r, 10, 10000));
+        output_buffer.suppress_output = false;
+        output_buffer.next_chunk_index = 0;
+        output_buffer.chunks.clear();
+        relaxed_map_param = make_relaxed_params(map_param);
+
+        // Reset worker statistics for pass 2
+        for (auto& ws : worker_statistics) {
+            ws = AlignmentStatistics{};
+        }
+
+        workers.clear();
+        std::vector<int> worker_done2(opt.n_threads);
+        // Reset abundances for pass 2
+        for (auto& wa : worker_abundances) {
+            std::fill(wa.begin(), wa.end(), 0.0);
+        }
+        for (int i = 0; i < opt.n_threads; ++i) {
+            std::thread consumer(perform_task, std::ref(input_buffer2), std::ref(output_buffer),
+                std::ref(worker_statistics[i]), std::ref(worker_done2[i]), std::ref(aln_params),
+                std::ref(map_param), std::ref(index_parameters), std::ref(references),
+                std::ref(index), std::ref(opt.read_group_id), std::ref(worker_abundances[i]),
+                nullptr, &hotspot_map, &relaxed_map_param);
+            workers.push_back(std::move(consumer));
+        }
+        if (opt.show_progress && isatty(2)) {
+            show_progress_until_done(worker_done2, worker_statistics);
+        }
+        for (auto& worker : workers) {
+            worker.join();
+        }
+        logger.info() << "Pass 2 done in " << pass2_timer.elapsed() << " s.\n";
+        logger.debug() << "Maximum number of chunks kept in the output buffer simultaneously: " << output_buffer.get_max_entries() << '\n';
+    } else {
+        // ---- Single-pass (original behavior) ----
+        std::vector<std::thread> workers;
+        std::vector<int> worker_done(opt.n_threads);
+        for (int i = 0; i < opt.n_threads; ++i) {
+            std::thread consumer(perform_task, std::ref(input_buffer), std::ref(output_buffer),
+                std::ref(worker_statistics[i]), std::ref(worker_done[i]), std::ref(aln_params),
+                std::ref(map_param), std::ref(index_parameters), std::ref(references),
+                std::ref(index), std::ref(opt.read_group_id), std::ref(worker_abundances[i]),
+                nullptr, nullptr, nullptr);
+            workers.push_back(std::move(consumer));
+        }
+        if (opt.show_progress && isatty(2)) {
+            show_progress_until_done(worker_done, worker_statistics);
+        }
+        for (auto& worker : workers) {
+            worker.join();
+        }
+        logger.info() << "Done!\n";
+        logger.debug() << "Maximum number of chunks kept in the output buffer simultaneously: " << output_buffer.get_max_entries() << '\n';
     }
-    if (opt.show_progress && isatty(2)) {
-        show_progress_until_done(worker_done, worker_statistics);
-    }
-    for (auto& worker : workers) {
-        worker.join();
-    }
-    logger.info() << "Done!\n";
-    logger.debug() << "Maximum number of chunks kept in the output buffer simultaneously: " << output_buffer.get_max_entries() << '\n';
 
     AlignmentStatistics statistics;
     for (auto& it : worker_statistics) {
