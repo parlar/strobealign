@@ -79,13 +79,19 @@ std::vector<ScoredAlignmentPair> get_best_scoring_pairs(
     float mu,
     float sigma
 ) {
+    // Precompute: log(normal_pdf(x,mu,sigma)) = -0.5*((x-mu)/sigma)^2 - log(sigma) - 0.5*log(2*pi)
+    const double inv_sigma = 1.0 / sigma;
+    const double log_norm_const = -std::log(sigma) - 0.5 * std::log(2.0 * M_PI);
+    const float dist_threshold = mu + 4 * sigma;
+
     std::vector<ScoredAlignmentPair> pairs;
     for (auto &a1 : alignments1) {
         for (auto &a2 : alignments2) {
             float dist = std::abs(a1.ref_start - a2.ref_start);
             double score = a1.score + a2.score;
-            if ((a1.is_revcomp ^ a2.is_revcomp) && (dist < mu + 4 * sigma)) {
-                score += log(normal_pdf(dist, mu, sigma));
+            if ((a1.is_revcomp ^ a2.is_revcomp) && (dist < dist_threshold)) {
+                double a = (dist - mu) * inv_sigma;
+                score += -0.5 * a * a + log_norm_const;
             }
             else { // individual score
                 // 10 corresponds to a value of log(normal_pdf(dist, mu, sigma)) of more than 4 stddevs away
@@ -98,7 +104,7 @@ std::vector<ScoredAlignmentPair> get_best_scoring_pairs(
     return pairs;
 }
 
-bool is_proper_nam_pair(const Nam nam1, const Nam nam2, float mu, float sigma) {
+bool is_proper_nam_pair(const Nam& nam1, const Nam& nam2, float mu, float sigma) {
     if (nam1.ref_id != nam2.ref_id || nam1.is_revcomp == nam2.is_revcomp) {
         return false;
     }
@@ -209,15 +215,13 @@ Alignment rescue_align(
 ) {
     Alignment alignment;
     int a, b;
-    std::string r_tmp;
     auto read_len = read.size();
 
+    const std::string& r_tmp = mate_nam.is_revcomp ? read.seq : read.rc;
     if (mate_nam.is_revcomp) {
-        r_tmp = read.seq;
         a = mate_nam.projected_ref_start() - (mu+sigma_mult*sigma);
         b = mate_nam.projected_ref_start() + read_len/2; // at most half read overlap
     } else {
-        r_tmp = read.rc; // mate is rc since fr orientation
         a = mate_nam.ref_end + (read_len - mate_nam.query_end) - read_len/2; // at most half read overlap
         b = mate_nam.ref_end + (read_len - mate_nam.query_end) + (mu+sigma_mult*sigma);
     }

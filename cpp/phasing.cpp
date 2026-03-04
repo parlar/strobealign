@@ -2,14 +2,62 @@
 
 #include <algorithm>
 #include <cctype>
+#include <charconv>
+#include <cstdlib>
+#include <cstring>
 #include <fstream>
-#include <sstream>
 #include <stdexcept>
+#include <string_view>
 #include <unordered_map>
 
 #include "logger.hpp"
 
 static Logger& logger = Logger::get();
+
+// Fast tab-field extraction: returns string_view to the n-th tab-separated field (0-based)
+// Returns empty view if field not found
+static inline std::string_view get_tab_field(const char* line, size_t len, int field_idx) {
+    const char* p = line;
+    const char* end = line + len;
+    for (int i = 0; i < field_idx; i++) {
+        p = static_cast<const char*>(std::memchr(p, '\t', end - p));
+        if (!p) return {};
+        p++;
+    }
+    const char* tab = static_cast<const char*>(std::memchr(p, '\t', end - p));
+    return {p, static_cast<size_t>(tab ? tab - p : end - p)};
+}
+
+// Fast colon-field extraction: returns string_view to the n-th colon-separated field
+static inline std::string_view get_colon_field(std::string_view sv, int field_idx) {
+    const char* p = sv.data();
+    const char* end = p + sv.size();
+    for (int i = 0; i < field_idx; i++) {
+        p = static_cast<const char*>(std::memchr(p, ':', end - p));
+        if (!p) return {};
+        p++;
+    }
+    const char* colon = static_cast<const char*>(std::memchr(p, ':', end - p));
+    return {p, static_cast<size_t>(colon ? colon - p : end - p)};
+}
+
+// Find the index of a field name (like "GT" or "PS") in a colon-separated FORMAT string
+static inline int find_format_index(std::string_view format, std::string_view name) {
+    const char* p = format.data();
+    const char* end = p + format.size();
+    int idx = 0;
+    while (p < end) {
+        const char* colon = static_cast<const char*>(std::memchr(p, ':', end - p));
+        size_t flen = colon ? static_cast<size_t>(colon - p) : static_cast<size_t>(end - p);
+        if (flen == name.size() && std::memcmp(p, name.data(), flen) == 0) {
+            return idx;
+        }
+        if (!colon) break;
+        p = colon + 1;
+        idx++;
+    }
+    return -1;
+}
 
 /*
  * Parse a phased VCF file and load biallelic SNPs with phased genotypes.
@@ -36,54 +84,47 @@ void PhasingMap::load(const std::string& vcf_filename, const References& refs) {
     while (std::getline(vcf, line)) {
         if (line.empty() || line[0] == '#') continue;
 
-        // Parse tab-separated fields: CHROM POS ID REF ALT QUAL FILTER INFO FORMAT SAMPLE...
-        std::istringstream iss(line);
-        std::string chrom, id, ref, alt, qual, filter, info, format, sample;
-        int pos;
-        if (!(iss >> chrom >> pos >> id >> ref >> alt >> qual >> filter >> info >> format >> sample)) {
+        const char* data = line.data();
+        size_t len = line.size();
+
+        // Fields: CHROM(0) POS(1) ID(2) REF(3) ALT(4) QUAL(5) FILTER(6) INFO(7) FORMAT(8) SAMPLE(9)
+        auto chrom_sv = get_tab_field(data, len, 0);
+        auto pos_sv = get_tab_field(data, len, 1);
+        auto ref_sv = get_tab_field(data, len, 3);
+        auto alt_sv = get_tab_field(data, len, 4);
+        auto format_sv = get_tab_field(data, len, 8);
+        auto sample_sv = get_tab_field(data, len, 9);
+
+        if (chrom_sv.empty() || pos_sv.empty() || ref_sv.empty() || alt_sv.empty()
+            || format_sv.empty() || sample_sv.empty()) {
             skipped++;
             continue;
         }
 
-        // Skip non-SNPs (indels, multiallelic)
-        if (ref.size() != 1 || alt.size() != 1 || alt.find(',') != std::string::npos) {
+        // Skip non-SNPs
+        if (ref_sv.size() != 1 || alt_sv.size() != 1 || alt_sv.find(',') != std::string_view::npos) {
             skipped++;
             continue;
         }
 
-        // Find GT field index in FORMAT
-        int gt_index = -1;
-        int ps_index = -1;
-        {
-            std::istringstream fmt_iss(format);
-            std::string field;
-            int idx = 0;
-            while (std::getline(fmt_iss, field, ':')) {
-                if (field == "GT") gt_index = idx;
-                if (field == "PS") ps_index = idx;
-                idx++;
-            }
+        // Parse position
+        int pos = 0;
+        auto [ptr, ec] = std::from_chars(pos_sv.data(), pos_sv.data() + pos_sv.size(), pos);
+        if (ec != std::errc()) {
+            skipped++;
+            continue;
         }
+
+        // Find GT and PS indices in FORMAT
+        int gt_index = find_format_index(format_sv, "GT");
         if (gt_index < 0) {
             skipped++;
             continue;
         }
+        int ps_index = find_format_index(format_sv, "PS");
 
-        // Extract GT and PS from sample field
-        std::string gt_val;
-        int ps_val = 0;
-        {
-            std::istringstream smp_iss(sample);
-            std::string field;
-            int idx = 0;
-            while (std::getline(smp_iss, field, ':')) {
-                if (idx == gt_index) gt_val = field;
-                if (idx == ps_index) {
-                    try { ps_val = std::stoi(field); } catch (...) { ps_val = 0; }
-                }
-                idx++;
-            }
-        }
+        // Extract GT value
+        auto gt_val = get_colon_field(sample_sv, gt_index);
 
         // Must be phased (pipe-separated) heterozygous
         if (gt_val.size() != 3 || gt_val[1] != '|') {
@@ -93,33 +134,38 @@ void PhasingMap::load(const std::string& vcf_filename, const References& refs) {
         int allele1 = gt_val[0] - '0';
         int allele2 = gt_val[2] - '0';
         if (allele1 == allele2) {
-            skipped++;  // Homozygous
+            skipped++;
             continue;
         }
         if ((allele1 != 0 && allele1 != 1) || (allele2 != 0 && allele2 != 1)) {
-            skipped++;  // Non-biallelic GT
+            skipped++;
             continue;
         }
 
+        // Extract PS value if available
+        int ps_val = 0;
+        if (ps_index >= 0) {
+            auto ps_sv = get_colon_field(sample_sv, ps_index);
+            if (!ps_sv.empty()) {
+                std::from_chars(ps_sv.data(), ps_sv.data() + ps_sv.size(), ps_val);
+            }
+        }
+
         // Find ref_id
-        auto it = name_to_id.find(chrom);
+        std::string chrom_str(chrom_sv);
+        auto it = name_to_id.find(chrom_str);
         if (it == name_to_id.end()) {
             skipped++;
             continue;
         }
 
-        // phase: which haplotype carries the ALT allele
-        // If GT=0|1, haplotype 2 carries ALT
-        // If GT=1|0, haplotype 1 carries ALT
         int phase = (allele1 == 1) ? 1 : 2;
-
-        // Use PS field if available, otherwise use position as phase set
         if (ps_val == 0) ps_val = pos;
 
         PhasedVariant var;
         var.position = pos - 1;  // VCF is 1-based, convert to 0-based
-        var.ref_allele = std::toupper(ref[0]);
-        var.alt_allele = std::toupper(alt[0]);
+        var.ref_allele = ref_sv[0] & 0xDF;  // uppercase via bitmask
+        var.alt_allele = alt_sv[0] & 0xDF;
         var.phase = phase;
         var.phase_set = ps_val;
 
@@ -142,14 +188,23 @@ void PhasingMap::load(const std::string& vcf_filename, const References& refs) {
  * Walk the CIGAR to find which base the read has at each phased variant position.
  * Count votes for haplotype 1 vs haplotype 2.
  */
-static char complement(char c) {
-    switch (c) {
-        case 'A': return 'T'; case 'T': return 'A';
-        case 'C': return 'G'; case 'G': return 'C';
-        case 'a': return 't'; case 't': return 'a';
-        case 'c': return 'g'; case 'g': return 'c';
-        default: return 'N';
-    }
+static inline const char* make_complement_table() {
+    static char table[256] = {};
+    table[static_cast<unsigned char>('A')] = 'T';
+    table[static_cast<unsigned char>('T')] = 'A';
+    table[static_cast<unsigned char>('C')] = 'G';
+    table[static_cast<unsigned char>('G')] = 'C';
+    table[static_cast<unsigned char>('a')] = 't';
+    table[static_cast<unsigned char>('t')] = 'a';
+    table[static_cast<unsigned char>('c')] = 'g';
+    table[static_cast<unsigned char>('g')] = 'c';
+    return table;
+}
+
+static inline char complement(char c) {
+    static const char* table = make_complement_table();
+    char r = table[static_cast<unsigned char>(c)];
+    return r ? r : 'N';
 }
 
 static std::string reverse_complement(const std::string& seq) {

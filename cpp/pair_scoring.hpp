@@ -39,7 +39,7 @@ std::vector<ScoredAlignmentPair> get_best_scoring_pairs(
     float mu,
     float sigma);
 
-bool is_proper_nam_pair(const Nam nam1, const Nam nam2, float mu, float sigma);
+bool is_proper_nam_pair(const Nam& nam1, const Nam& nam2, float mu, float sigma);
 
 std::vector<NamPair> get_best_scoring_nam_pairs(
     const std::vector<Nam>& nams1,

@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <numeric>
 #include <tuple>
 #include <math.h>
@@ -115,20 +116,15 @@ bool has_significant_soft_clip(const Alignment& primary, int read_len, int min_c
  */
 bool reverse_nam_if_needed(Nam& nam, const Read& read, const References& references, int k) {
     auto read_len = read.size();
-    std::string ref_start_kmer = references.sequences[nam.ref_id].substr(nam.ref_start, k);
-    std::string ref_end_kmer = references.sequences[nam.ref_id].substr(nam.ref_end-k, k);
+    const auto& ref_seq = references.sequences[nam.ref_id];
+    const char* ref_start_ptr = ref_seq.data() + nam.ref_start;
+    const char* ref_end_ptr = ref_seq.data() + nam.ref_end - k;
 
-    std::string seq, seq_rc;
-    if (nam.is_revcomp) {
-        seq = read.rc;
-        seq_rc = read.seq;
-    } else {
-        seq = read.seq;
-        seq_rc = read.rc;
-    }
-    std::string read_start_kmer = seq.substr(nam.query_start, k);
-    std::string read_end_kmer = seq.substr(nam.query_end-k, k);
-    if (ref_start_kmer == read_start_kmer && ref_end_kmer == read_end_kmer) {
+    const std::string& seq = nam.is_revcomp ? read.rc : read.seq;
+    const std::string& seq_rc = nam.is_revcomp ? read.seq : read.rc;
+
+    if (std::memcmp(ref_start_ptr, seq.data() + nam.query_start, k) == 0
+        && std::memcmp(ref_end_ptr, seq.data() + nam.query_end - k, k) == 0) {
         return true;
     }
 
@@ -137,9 +133,8 @@ bool reverse_nam_if_needed(Nam& nam, const Read& read, const References& referen
     int q_start_tmp = read_len - nam.query_end;
     int q_end_tmp = read_len - nam.query_start;
     // false reverse hit, change coordinates in nam to forward
-    read_start_kmer = seq_rc.substr(q_start_tmp, k);
-    read_end_kmer = seq_rc.substr(q_end_tmp - k, k);
-    if (ref_start_kmer == read_start_kmer && ref_end_kmer == read_end_kmer) {
+    if (std::memcmp(ref_start_ptr, seq_rc.data() + q_start_tmp, k) == 0
+        && std::memcmp(ref_end_ptr, seq_rc.data() + q_end_tmp - k, k) == 0) {
         nam.is_revcomp = !nam.is_revcomp;
         nam.query_start = q_start_tmp;
         nam.query_end = q_end_tmp;
@@ -498,7 +493,7 @@ inline Alignment extend_seed(
     const Read& read,
     bool consistent_nam
 ) {
-    const std::string query = nam.is_revcomp ? read.rc : read.seq;
+    const std::string& query = nam.is_revcomp ? read.rc : read.seq;
     const std::string& ref = references.sequences[nam.ref_id];
 
     const auto projected_ref_start = nam.projected_ref_start();
