@@ -6,6 +6,9 @@
 #include <numeric>
 #include <math.h>
 #include "chain.hpp"
+#include "clip.hpp"
+#include "sv_tags.hpp"
+#include "pair_scoring.hpp"
 #include "revcomp.hpp"
 #include "timer.hpp"
 #include "nam.hpp"
@@ -67,490 +70,6 @@ std::vector<Alignment> select_supplementary(
         }
     }
     return supplementaries;
-}
-
-/*
- * Compute YT pair-type tag for SV calling:
- *   UU - both unmapped
- *   IC - inter-chromosomal (different references)
- *   DO - deviant orientation (same reference, same strand)
- *   CP - concordant pair (matches is_proper_pair: inward FR, insert <= mu + 6σ)
- *   DI - deviant insert size (opposite strands but not concordant)
- *
- * Returns empty string when exactly one read is unmapped (no useful SV signal).
- * CP classification uses is_proper_pair() to stay consistent with the PROPER_PAIR flag.
- */
-std::string compute_yt_tag(
-    const Alignment& a1, const Alignment& a2, float mu, float sigma
-) {
-    if (a1.is_unaligned && a2.is_unaligned) {
-        return "YT:Z:UU";
-    }
-    if (a1.is_unaligned || a2.is_unaligned) {
-        return "";
-    }
-    if (a1.ref_id != a2.ref_id) {
-        return "YT:Z:IC";
-    }
-    // Same chromosome, same strand → deviant orientation
-    if (a1.is_revcomp == a2.is_revcomp) {
-        return "YT:Z:DO";
-    }
-    // Opposite strands — use is_proper_pair for CP to match PROPER_PAIR flag
-    if (is_proper_pair(a1, a2, mu, sigma)) {
-        return "YT:Z:CP";
-    }
-    return "YT:Z:DI";
-}
-
-/*
- * Compute YD insert-size Z-score: |insert_size - mu| / sigma
- * Only meaningful when both reads map to the same chromosome.
- */
-std::string compute_yd_tag(
-    const Alignment& a1, const Alignment& a2, float mu, float sigma
-) {
-    if (a1.is_unaligned || a2.is_unaligned) return "";
-    if (a1.ref_id != a2.ref_id) return "";
-    if (sigma <= 0) return "";
-    int insert = std::abs(a2.ref_start - a1.ref_start);
-    float zscore = std::abs(insert - mu) / sigma;
-    // Format with 2 decimal places
-    char buf[32];
-    std::snprintf(buf, sizeof(buf), "YD:f:%.2f", zscore);
-    return buf;
-}
-
-/*
- * Compute Xr rescue-status tag:
- *   0 - full search (normal alignment, not fast path and no rescue)
- *   1 - fast path (score == -1 in alignment pairs)
- *   2 - mate was rescued
- */
-std::string compute_xr_tag(const Details& details, bool is_fast_path) {
-    if (details.mate_rescue > 0) {
-        return "Xr:i:2";
-    }
-    if (is_fast_path) {
-        return "Xr:i:1";
-    }
-    return "Xr:i:0";
-}
-
-/*
- * Classify SV type for supplementary vs primary:
- *   TRA - different chromosomes (translocation)
- *   INV - same chromosome, different strands (inversion)
- *   DUP - same chromosome, same strand, reference ranges overlap (duplication)
- *   DEL - same chromosome, same strand, no reference overlap (deletion)
- */
-std::string classify_sv_type(const Alignment& supp, const Alignment& primary) {
-    if (supp.ref_id != primary.ref_id) {
-        return "TRA";
-    }
-    if (supp.is_revcomp != primary.is_revcomp) {
-        return "INV";
-    }
-    int supp_end = supp.ref_start + supp.length;
-    int prim_end = primary.ref_start + primary.length;
-    bool overlap = (supp.ref_start < prim_end && primary.ref_start < supp_end);
-    return overlap ? "DUP" : "DEL";
-}
-
-std::string compute_ys_tag(const Alignment& supp, const Alignment& primary) {
-    return "YS:Z:" + classify_sv_type(supp, primary);
-}
-
-/*
- * Breakpoint info for a primary-supplementary pair.
- */
-struct BreakpointInfo {
-    int left_ref_id{-1}, right_ref_id{-1};
-    int left_bp{0}, right_bp{0};
-    int mh_fwd{0}, mh_bwd{0};
-    int left_ci{0}, right_ci{0};
-    std::string inserted_seq;
-    std::string sv_type;
-
-    std::string format_all(const References& refs) const {
-        std::string result;
-        // YB: breakpoint intervals
-        int left_lo = left_bp - mh_bwd;
-        int left_hi = left_bp + mh_fwd;
-        int right_lo = right_bp - mh_bwd;
-        int right_hi = right_bp + mh_fwd;
-        result += "YB:Z:";
-        result += refs.names[left_ref_id];
-        result += ':';
-        result += std::to_string(left_lo);
-        result += '-';
-        result += std::to_string(left_hi);
-        result += '|';
-        result += refs.names[right_ref_id];
-        result += ':';
-        result += std::to_string(right_lo);
-        result += '-';
-        result += std::to_string(right_hi);
-        // YC: CI widths
-        result += "\tYC:Z:";
-        result += std::to_string(left_ci);
-        result += ',';
-        result += std::to_string(right_ci);
-        // YM: microhomology
-        result += "\tYM:i:";
-        result += std::to_string(mh_fwd + mh_bwd);
-        // YI: inserted sequence (only if present)
-        if (!inserted_seq.empty()) {
-            result += "\tYI:Z:";
-            result += inserted_seq;
-        }
-        // YA: alternative placements (only if microhomology > 0 and <= 20)
-        int mh_total = mh_fwd + mh_bwd;
-        if (mh_total > 0 && mh_total <= 20) {
-            result += "\tYA:Z:";
-            bool first = true;
-            for (int i = -mh_bwd; i <= mh_fwd; ++i) {
-                if (!first) result += ';';
-                result += std::to_string(left_bp + i);
-                result += ',';
-                result += std::to_string(right_bp + i);
-                first = false;
-            }
-        }
-        return result;
-    }
-};
-
-/*
- * Determine the "facing" reference position for an alignment at the split point.
- * If the alignment covers the LEFT part of the read (earlier query coords),
- * the breakpoint faces right: ref_end (forward) or ref_start (RC).
- * If it covers the RIGHT part: ref_start (forward) or ref_end (RC).
- */
-int facing_ref_pos(const Alignment& aln, bool covers_left_of_read) {
-    if (covers_left_of_read) {
-        return aln.is_revcomp ? aln.ref_start : (aln.ref_start + aln.length);
-    } else {
-        return aln.is_revcomp ? (aln.ref_start + aln.length) : aln.ref_start;
-    }
-}
-
-/*
- * Compute microhomology by bidirectional reference scan at breakpoint junction.
- * Returns {forward_matches, backward_matches}.
- */
-std::pair<int, int> compute_microhomology(
-    const References& references,
-    int left_ref_id, int left_bp,
-    int right_ref_id, int right_bp
-) {
-    const auto& left_seq = references.sequences[left_ref_id];
-    const auto& right_seq = references.sequences[right_ref_id];
-
-    // Forward scan
-    int fwd = 0;
-    int max_fwd = std::min({
-        static_cast<int>(left_seq.size()) - left_bp,
-        static_cast<int>(right_seq.size()) - right_bp,
-        50
-    });
-    for (int i = 0; i < max_fwd; ++i) {
-        char l = std::toupper(left_seq[left_bp + i]);
-        char r = std::toupper(right_seq[right_bp + i]);
-        if (l == 'N' || r == 'N' || l != r) break;
-        fwd++;
-    }
-
-    // Backward scan
-    int bwd = 0;
-    int max_bwd = std::min({left_bp, right_bp, 50});
-    for (int i = 0; i < max_bwd; ++i) {
-        char l = std::toupper(left_seq[left_bp - 1 - i]);
-        char r = std::toupper(right_seq[right_bp - 1 - i]);
-        if (l == 'N' || r == 'N' || l != r) break;
-        bwd++;
-    }
-    return {fwd, bwd};
-}
-
-/*
- * Detect inserted sequence at the breakpoint junction.
- * Uses forward-strand query coordinates to find uncovered read bases.
- */
-std::string compute_inserted_sequence(
-    const Alignment& primary,
-    const Alignment& supp,
-    const std::string& read_seq
-) {
-    // query_start/query_end are already forward-strand coordinates
-    if (primary.query_end <= supp.query_start) {
-        int gap_start = primary.query_end;
-        int gap_end = supp.query_start;
-        if (gap_end > gap_start && gap_end <= static_cast<int>(read_seq.size())) {
-            return read_seq.substr(gap_start, gap_end - gap_start);
-        }
-    } else if (supp.query_end <= primary.query_start) {
-        int gap_start = supp.query_end;
-        int gap_end = primary.query_start;
-        if (gap_end > gap_start && gap_end <= static_cast<int>(read_seq.size())) {
-            return read_seq.substr(gap_start, gap_end - gap_start);
-        }
-    }
-    return "";
-}
-
-/*
- * Compute confidence interval width for a breakpoint position.
- * CI = microhomology_total + round(local_repeat_fraction * 10)
- */
-int compute_ci_width(
-    const References& references,
-    int ref_id, int bp_pos,
-    int microhomology_total
-) {
-    const auto& seq = references.sequences[ref_id];
-    int window = 50;
-    int start = std::max(0, bp_pos - window);
-    int end = std::min(static_cast<int>(seq.size()), bp_pos + window);
-    int total_bases = end - start;
-    if (total_bases <= 0) return microhomology_total;
-
-    // Detect homopolymer runs (>=3bp)
-    int repeat_bases = 0;
-    for (int i = start; i < end; ) {
-        char c = std::toupper(seq[i]);
-        int run = 1;
-        while (i + run < end && std::toupper(seq[i + run]) == c) run++;
-        if (run >= 3) repeat_bases += run;
-        i += run;
-    }
-
-    // Detect dinucleotide repeats (>=6bp = 3 units)
-    for (int i = start; i < end - 5; ) {
-        char c1 = std::toupper(seq[i]);
-        char c2 = std::toupper(seq[i + 1]);
-        if (c1 == c2) { i++; continue; }
-        int run = 2;
-        while (i + run + 1 < end &&
-               std::toupper(seq[i + run]) == c1 &&
-               std::toupper(seq[i + run + 1]) == c2) {
-            run += 2;
-        }
-        if (run >= 6) repeat_bases += run;
-        i += std::max(run, 1);
-    }
-
-    // Cap repeat_bases at total_bases to avoid fraction > 1
-    repeat_bases = std::min(repeat_bases, total_bases);
-    float repeat_frac = static_cast<float>(repeat_bases) / total_bases;
-    int repeat_bonus = std::lround(repeat_frac * 10.0f);
-    return microhomology_total + repeat_bonus;
-}
-
-/*
- * Compute full breakpoint info for a primary-supplementary pair.
- */
-BreakpointInfo compute_breakpoint_info(
-    const Alignment& primary,
-    const Alignment& supp,
-    const References& references,
-    const std::string& read_seq
-) {
-    BreakpointInfo bp;
-    bp.sv_type = classify_sv_type(supp, primary);
-
-    // Determine breakpoint positions based on SV type
-    if (bp.sv_type == "DEL") {
-        // Same strand, no overlap — earlier ref_end is left_bp, later ref_start is right_bp
-        if (primary.ref_start <= supp.ref_start) {
-            bp.left_bp = primary.ref_start + primary.length;
-            bp.right_bp = supp.ref_start;
-        } else {
-            bp.left_bp = supp.ref_start + supp.length;
-            bp.right_bp = primary.ref_start;
-        }
-        bp.left_ref_id = bp.right_ref_id = primary.ref_id;
-    } else if (bp.sv_type == "DUP") {
-        // Same strand, overlapping — later ref_start is left_bp, earlier ref_end is right_bp
-        if (primary.ref_start <= supp.ref_start) {
-            bp.left_bp = supp.ref_start;
-            bp.right_bp = primary.ref_start + primary.length;
-        } else {
-            bp.left_bp = primary.ref_start;
-            bp.right_bp = supp.ref_start + supp.length;
-        }
-        bp.left_ref_id = bp.right_ref_id = primary.ref_id;
-    } else {
-        // INV or TRA — use facing-end logic based on query coordinate ordering
-        // The alignment covering the left part of the read provides the "left" breakpoint
-        bool primary_covers_left = (primary.query_start <= supp.query_start);
-        const auto& left_aln = primary_covers_left ? primary : supp;
-        const auto& right_aln = primary_covers_left ? supp : primary;
-
-        bp.left_bp = facing_ref_pos(left_aln, true);
-        bp.right_bp = facing_ref_pos(right_aln, false);
-        bp.left_ref_id = left_aln.ref_id;
-        bp.right_ref_id = right_aln.ref_id;
-    }
-
-    // Bounds check
-    bp.left_bp = std::max(0, std::min(bp.left_bp, static_cast<int>(references.sequences[bp.left_ref_id].size())));
-    bp.right_bp = std::max(0, std::min(bp.right_bp, static_cast<int>(references.sequences[bp.right_ref_id].size())));
-
-    // Microhomology — skip if both breakpoints are at the same position (degenerate INV)
-    if (bp.left_ref_id == bp.right_ref_id && bp.left_bp == bp.right_bp) {
-        bp.mh_fwd = 0;
-        bp.mh_bwd = 0;
-    } else {
-        auto [fwd, bwd] = compute_microhomology(references, bp.left_ref_id, bp.left_bp, bp.right_ref_id, bp.right_bp);
-        bp.mh_fwd = fwd;
-        bp.mh_bwd = bwd;
-    }
-
-    // Inserted sequence
-    bp.inserted_seq = compute_inserted_sequence(primary, supp, read_seq);
-
-    // Confidence intervals
-    int mh_total = bp.mh_fwd + bp.mh_bwd;
-    bp.left_ci = compute_ci_width(references, bp.left_ref_id, bp.left_bp, mh_total);
-    bp.right_ci = compute_ci_width(references, bp.right_ref_id, bp.right_bp, mh_total);
-
-    return bp;
-}
-
-/*
- * Compute XE: split chain entropy (SE only, --sv-tags).
- * Boltzmann entropy over alignment scores:
- *   p_i = exp(score_i / T) / Z,  H = -sum(p_i * log2(p_i))
- * Low entropy = one dominant alignment = confident. High entropy = ambiguous.
- * Only meaningful when supplementaries exist (split reads).
- */
-float compute_split_entropy(const std::vector<Alignment>& alignments) {
-    if (alignments.size() <= 1) return 0.0f;
-    constexpr double T = 10.0;
-    // Find max score for numerical stability
-    int max_score = alignments[0].score;
-    for (const auto& a : alignments) {
-        if (a.score > max_score) max_score = a.score;
-    }
-    // Compute Boltzmann weights
-    double Z = 0.0;
-    std::vector<double> weights;
-    weights.reserve(alignments.size());
-    for (const auto& a : alignments) {
-        double w = std::exp((a.score - max_score) / T);
-        weights.push_back(w);
-        Z += w;
-    }
-    // Compute entropy
-    double H = 0.0;
-    for (double w : weights) {
-        double p = w / Z;
-        if (p > 0.0) {
-            H -= p * std::log2(p);
-        }
-    }
-    return static_cast<float>(H);
-}
-
-/*
- * Compute XF: maximum artifact probability across supplementary alignments.
- * Heuristic score (0.0-1.0) based on:
- *   - Supplementary aligned length as fraction of read length (short = suspicious)
- *   - Supplementary score as fraction of primary score (low = suspicious)
- * XF = max over supplementaries of: 1.0 - (len_frac * score_frac)
- * High XF = likely artifact. Low XF = confident split.
- */
-float compute_max_artifact_prob(
-    const Alignment& primary,
-    const std::vector<Alignment>& supplementaries,
-    int read_length
-) {
-    if (supplementaries.empty() || primary.score <= 0 || read_length <= 0) return 0.0f;
-    float max_prob = 0.0f;
-    for (const auto& s : supplementaries) {
-        float len_frac = static_cast<float>(s.query_end - s.query_start) / read_length;
-        float score_frac = static_cast<float>(s.score) / primary.score;
-        // Clamp to [0, 1]
-        len_frac = std::min(1.0f, std::max(0.0f, len_frac));
-        score_frac = std::min(1.0f, std::max(0.0f, score_frac));
-        float artifact = 1.0f - (len_frac * score_frac);
-        if (artifact > max_prob) max_prob = artifact;
-    }
-    return max_prob;
-}
-
-/*
- * Compute XD (score delta) and XR (score ratio) between primary and best supplementary.
- * Supplementaries are already sorted by score descending from select_supplementary().
- */
-std::string compute_supp_delta_tags(const Alignment& primary, const std::vector<Alignment>& supplementaries) {
-    if (supplementaries.empty() || primary.score <= 0) return "";
-    int best_supp_score = supplementaries[0].score;
-    int delta = primary.score - best_supp_score;
-    float ratio = static_cast<float>(best_supp_score) / primary.score;
-    char buf[64];
-    std::snprintf(buf, sizeof(buf), "XD:i:%d\tXR:f:%.3f", delta, ratio);
-    return buf;
-}
-
-/*
- * Build SV extra_tags string for a paired-end read.
- * Combines YT + YD + Xr tags, tab-separated.
- */
-std::string build_sv_tags(
-    const Alignment& a1, const Alignment& a2,
-    float mu, float sigma,
-    const Details& details, bool is_fast_path
-) {
-    std::string tags;
-    auto yt = compute_yt_tag(a1, a2, mu, sigma);
-    if (!yt.empty()) {
-        tags = yt;
-    }
-    auto yd = compute_yd_tag(a1, a2, mu, sigma);
-    if (!yd.empty()) {
-        if (!tags.empty()) tags += '\t';
-        tags += yd;
-    }
-    auto xr = compute_xr_tag(details, is_fast_path);
-    if (!tags.empty()) tags += '\t';
-    tags += xr;
-    return tags;
-}
-
-struct NamPair {
-    float score;
-    Nam nam1;
-    Nam nam2;
-};
-
-std::ostream& operator<<(std::ostream& os, const NamPair& nam_pair) {
-    os << "NamPair(score=" << nam_pair.score << ", nam1=" << nam_pair.nam1 << ", nam2=" << nam_pair.nam2 << ")";
-
-    return os;
-}
-
-struct ScoredAlignmentPair {
-    double score;
-    Alignment alignment1;
-    Alignment alignment2;
-};
-
-/*
- * Compute Boltzmann-weighted posterior probability for the best pair.
- * P(best) = exp(score_best / T) / sum_i(exp(score_i / T)), T = 10.
- */
-float compute_pair_posterior(const std::vector<ScoredAlignmentPair>& pairs) {
-    if (pairs.empty()) return 0.0f;
-    if (pairs.size() == 1) return 1.0f;
-    constexpr double T = 10.0;
-    double best_score = pairs[0].score;
-    double sum = 0.0;
-    for (const auto& p : pairs) {
-        sum += std::exp((p.score - best_score) / T);
-    }
-    return static_cast<float>(1.0 / sum);
 }
 
 inline Alignment extend_seed(
@@ -835,6 +354,26 @@ inline void align_single(
         }
     }
 
+    // XK: soft-clip realignment for short clips not covered by supplementaries
+    if (sv_tags && !collector) {
+        bool left_covered = false, right_covered = false;
+        for (const auto& s : supplementaries) {
+            if (s.query_start < best_alignment.query_start) left_covered = true;
+            if (s.query_end > best_alignment.query_end) right_covered = true;
+        }
+        // Coverage flags are in forward-strand coords; for revcomp reads,
+        // forward-strand left = mapped-strand trailing (3') and vice versa.
+        if (best_alignment.is_revcomp) std::swap(left_covered, right_covered);
+        const auto& mapped_seq = best_alignment.is_revcomp ? read.rc : read.seq;
+        auto xk_clips = realign_soft_clips(
+            best_alignment, mapped_seq, references, aligner,
+            left_covered, right_covered);
+        if (!xk_clips.empty()) {
+            if (!extra_tags.empty()) extra_tags += '\t';
+            extra_tags += "XK:Z:" + format_xk_tag(xk_clips);
+        }
+    }
+
     // Output primary alignment
     sam.add(best_alignment, record, read.rc, mapq, PRIMARY, details, extra_tags);
 
@@ -1097,308 +636,6 @@ ReadSupplementaryInfo build_supplementary_info_from_candidates(
     build_sa_tags(info, sam, primary, mapq);
 
     return info;
-}
-
-/*
- * Return mapping quality for a read mapped in a proper pair
- */
-inline uint8_t proper_pair_mapq(const std::vector<Nam> &nams) {
-    if (nams.size() <= 1) {
-        return 60;
-    }
-    const float s1 = nams[0].score;
-    const float s2 = nams[1].score;
-    // from minimap2: MAPQ = 40(1−s2/s1) ·min{1,|M|/10} · log s1
-    const float min_matches = std::min(nams[0].n_matches / 10.0, 1.0);
-    const int uncapped_mapq = 40 * (1 - s2 / s1) * min_matches * log(s1);
-    return std::min(uncapped_mapq, 60);
-}
-
-/* Compute paired-end mapping score given best alignments (sorted by score) */
-std::pair<int, int> joint_mapq_from_high_scores(const std::vector<ScoredAlignmentPair>& pairs) {
-    if (pairs.size() <= 1) {
-        return std::make_pair(60, 60);
-    }
-    auto score1 = pairs[0].score;
-    auto score2 = pairs[1].score;
-    if (score1 == score2) {
-        return std::make_pair(0, 0);
-    }
-    int mapq;
-    const int diff = score1 - score2; // (1.0 - (S1 - S2) / S1);
-//  float log10_p = diff > 6 ? -6.0 : -diff; // Corresponds to: p_error= 0.1^diff // change in sw score times rough illumina error rate. This is highly heauristic, but so seem most computations of mapq scores
-    if (score1 > 0 && score2 > 0) {
-        mapq = std::min(60, diff);
-//            mapq1 = -10 * log10_p < 60 ? -10 * log10_p : 60;
-    } else if (score1 > 0 && score2 <= 0) {
-        mapq = 60;
-    } else { // both negative SW one is better
-        mapq = 1;
-    }
-    return std::make_pair(mapq, mapq);
-}
-
-inline float normal_pdf(float x, float mu, float sigma)
-{
-    static const float inv_sqrt_2pi = 0.3989422804014327;
-    const float a = (x - mu) / sigma;
-
-    return inv_sqrt_2pi / sigma * std::exp(-0.5f * a * a);
-}
-
-inline std::vector<ScoredAlignmentPair> get_best_scoring_pairs(
-    const std::vector<Alignment>& alignments1,
-    const std::vector<Alignment>& alignments2,
-    float mu,
-    float sigma
-) {
-    std::vector<ScoredAlignmentPair> pairs;
-    for (auto &a1 : alignments1) {
-        for (auto &a2 : alignments2) {
-            float dist = std::abs(a1.ref_start - a2.ref_start);
-            double score = a1.score + a2.score;
-            if ((a1.is_revcomp ^ a2.is_revcomp) && (dist < mu + 4 * sigma)) {
-                score += log(normal_pdf(dist, mu, sigma));
-            }
-            else { // individual score
-                // 10 corresponds to a value of log(normal_pdf(dist, mu, sigma)) of more than 4 stddevs away
-                score -= 10;
-            }
-            pairs.push_back(ScoredAlignmentPair{score, a1, a2});
-        }
-    }
-
-    return pairs;
-}
-
-bool is_proper_nam_pair(const Nam nam1, const Nam nam2, float mu, float sigma) {
-    if (nam1.ref_id != nam2.ref_id || nam1.is_revcomp == nam2.is_revcomp) {
-        return false;
-    }
-    int r1_ref_start = nam1.projected_ref_start();
-    int r2_ref_start = nam2.projected_ref_start();
-
-    // r1 ---> <---- r2
-    bool r1_r2 = nam2.is_revcomp && (r1_ref_start <= r2_ref_start) && (r2_ref_start - r1_ref_start < mu + 10*sigma);
-
-     // r2 ---> <---- r1
-    bool r2_r1 = nam1.is_revcomp && (r2_ref_start <= r1_ref_start) && (r1_ref_start - r2_ref_start < mu + 10*sigma);
-
-    return r1_r2 || r2_r1;
-}
-
-/*
- * Find high-scoring NAMs and NAM pairs. Proper pairs are preferred, but also
- * high-scoring NAMs that could not be paired up are returned (these get a
- * "dummy" NAM as partner in the returned vector).
- */
-inline std::vector<NamPair> get_best_scoring_nam_pairs(
-    const std::vector<Nam> &nams1,
-    const std::vector<Nam> &nams2,
-    float mu,
-    float sigma
-) {
-    std::vector<NamPair> nam_pairs;
-    if (nams1.empty() && nams2.empty()) {
-        return nam_pairs;
-    }
-
-    // Find NAM pairs that appear to be proper pairs
-    robin_hood::unordered_set<int> added_n1;
-    robin_hood::unordered_set<int> added_n2;
-    int best_joint_hits = 0;
-
-    constexpr size_t MAX_NAMS = 1000;
-    for (size_t i1 = 0; i1 < std::min(nams1.size(), MAX_NAMS); ++i1) {
-        const Nam& nam1 = nams1[i1];
-        for (size_t i2 = 0; i2 < std::min(nams2.size(), MAX_NAMS); ++i2) {
-            const Nam& nam2 = nams2[i2];
-            int joint_hits = nam1.n_matches + nam2.n_matches;
-            if (joint_hits < best_joint_hits / 2) {
-                break;
-            }
-            if (is_proper_nam_pair(nam1, nam2, mu, sigma)) {
-                nam_pairs.push_back(NamPair{nam1.score + nam2.score, nam1, nam2});
-                added_n1.insert(nam1.nam_id);
-                added_n2.insert(nam2.nam_id);
-                best_joint_hits = std::max(joint_hits, best_joint_hits);
-            }
-        }
-    }
-
-    // Find high-scoring R1 NAMs that are not part of a proper pair
-    Nam dummy_nam;
-    dummy_nam.ref_start = -1;
-    if (!nams1.empty()) {
-        int best_joint_hits1 = best_joint_hits > 0 ? best_joint_hits : nams1[0].n_matches;
-        for (auto &nam1 : nams1) {
-            if (nam1.n_matches < best_joint_hits1 / 2) {
-                break;
-            }
-            if (added_n1.find(nam1.nam_id) != added_n1.end()) {
-                continue;
-            }
-//            int n1_penalty = std::abs(nam1.query_span() - nam1.ref_span());
-            nam_pairs.push_back(NamPair{nam1.score, nam1, dummy_nam});
-        }
-    }
-
-    // Find high-scoring R2 NAMs that are not part of a proper pair
-    if (!nams2.empty()) {
-        int best_joint_hits2 = best_joint_hits > 0 ? best_joint_hits : nams2[0].n_matches;
-        for (auto &nam2 : nams2) {
-            if (nam2.n_matches < best_joint_hits2 / 2) {
-                break;
-            }
-            if (added_n2.find(nam2.nam_id) != added_n2.end()){
-                continue;
-            }
-//            int n2_penalty = std::abs(nam2.query_span() - nam2.ref_span());
-            nam_pairs.push_back(NamPair{nam2.score, dummy_nam, nam2});
-        }
-    }
-
-    std::sort(
-        nam_pairs.begin(),
-        nam_pairs.end(),
-        [](const NamPair& a, const NamPair& b) -> bool { return a.score > b.score; }
-    ); // Sort by highest score first
-
-    return nam_pairs;
-}
-
-/*
- * Align a read to the reference given the mapping location of its mate.
- */
-inline Alignment rescue_align(
-    const Aligner& aligner,
-    const Nam &mate_nam,
-    const References& references,
-    const Read& read,
-    float mu,
-    float sigma,
-    int k
-) {
-    Alignment alignment;
-    int a, b;
-    std::string r_tmp;
-    auto read_len = read.size();
-
-    if (mate_nam.is_revcomp) {
-        r_tmp = read.seq;
-        a = mate_nam.projected_ref_start() - (mu+5*sigma);
-        b = mate_nam.projected_ref_start() + read_len/2; // at most half read overlap
-    } else {
-        r_tmp = read.rc; // mate is rc since fr orientation
-        a = mate_nam.ref_end + (read_len - mate_nam.query_end) - read_len/2; // at most half read overlap
-        b = mate_nam.ref_end + (read_len - mate_nam.query_end) + (mu+5*sigma);
-    }
-
-    auto ref_len = static_cast<int>(references.lengths[mate_nam.ref_id]);
-    auto ref_start = std::max(0, std::min(a, ref_len));
-    auto ref_end = std::min(ref_len, std::max(0, b));
-
-    if (ref_end < ref_start + k) {
-        alignment.cigar = Cigar();
-        alignment.edit_distance = read_len;
-        alignment.score = 0;
-        alignment.ref_start =  0;
-        alignment.is_revcomp = !mate_nam.is_revcomp;
-        alignment.ref_id = mate_nam.ref_id;
-        alignment.is_unaligned = true;
-        return alignment;
-    }
-    std::string ref_segm = references.sequences[mate_nam.ref_id].substr(ref_start, ref_end - ref_start);
-
-    if (!has_shared_substring(r_tmp, ref_segm, k)) {
-        alignment.cigar = Cigar();
-        alignment.edit_distance = read_len;
-        alignment.score = 0;
-        alignment.ref_start =  0;
-        alignment.is_revcomp = !mate_nam.is_revcomp;
-        alignment.ref_id = mate_nam.ref_id;
-        alignment.is_unaligned = true;
-        return alignment;
-    }
-    auto opt_info = aligner.align(r_tmp, ref_segm);
-    if (opt_info) {
-        auto info = opt_info.value();
-        alignment.cigar = info.cigar;
-        alignment.edit_distance = info.edit_distance;
-        alignment.score = info.sw_score;
-        alignment.ref_start = ref_start + info.ref_start;
-        alignment.is_revcomp = !mate_nam.is_revcomp;
-        alignment.ref_id = mate_nam.ref_id;
-        alignment.is_unaligned = info.cigar.empty();
-        alignment.length = info.ref_span();
-
-        // Convert query coordinates to forward-strand
-        if (alignment.is_revcomp) {
-            int read_len = static_cast<int>(read.size());
-            alignment.query_start = read_len - info.query_end;
-            alignment.query_end = read_len - info.query_start;
-        } else {
-            alignment.query_start = info.query_start;
-            alignment.query_end = info.query_end;
-        }
-    } else {
-        alignment.is_unaligned = true;
-        alignment.edit_distance = 100000;
-        alignment.ref_start = 0;
-        alignment.score = -100000;
-    }
-    return alignment;
-}
-
-/*
- * Remove consecutive identical alignment pairs and leave only the first.
- */
-void deduplicate_scored_pairs(std::vector<ScoredAlignmentPair>& pairs) {
-    if (pairs.size() < 2) {
-        return;
-    }
-    int prev_ref_start1 = pairs[0].alignment1.ref_start;
-    int prev_ref_start2 = pairs[0].alignment2.ref_start;
-    int prev_ref_id1 = pairs[0].alignment1.ref_id;
-    int prev_ref_id2 = pairs[0].alignment2.ref_id;
-    size_t j = 1;
-    for (size_t i = 1; i < pairs.size(); i++) {
-        int ref_start1 = pairs[i].alignment1.ref_start;
-        int ref_start2 = pairs[i].alignment2.ref_start;
-        int ref_id1 = pairs[i].alignment1.ref_id;
-        int ref_id2 = pairs[i].alignment2.ref_id;
-        if (
-            ref_start1 != prev_ref_start1 ||
-            ref_start2 != prev_ref_start2 ||
-            ref_id1 != prev_ref_id1 ||
-            ref_id2 != prev_ref_id2
-        ) {
-            prev_ref_start1 = ref_start1;
-            prev_ref_start2 = ref_start2;
-            prev_ref_id1 = ref_id1;
-            prev_ref_id2 = ref_id2;
-            pairs[j] = pairs[i];
-            j++;
-        }
-    }
-    pairs.resize(j);
-}
-
-
-/*
- * Count how many best alignments there are that all have the same score
- */
-size_t count_best_alignment_pairs(const std::vector<ScoredAlignmentPair>& pairs) {
-    if (pairs.empty()) {
-        return 0;
-    }
-    size_t i = 1;
-    for ( ; i < pairs.size(); ++i) {
-        if (pairs[i].score != pairs[0].score) {
-            break;
-        }
-    }
-    return i;
 }
 
 
@@ -2110,6 +1347,33 @@ void align_or_map_paired(
                     }
                 }
 
+                // XK: soft-clip realignment for short clips
+                if (map_param.sv_tags && !collector) {
+                    bool lc1 = false, rc1 = false, lc2 = false, rc2 = false;
+                    for (const auto& s : si1.supps) {
+                        if (s.query_start < alignment1.query_start) lc1 = true;
+                        if (s.query_end > alignment1.query_end) rc1 = true;
+                    }
+                    for (const auto& s : si2.supps) {
+                        if (s.query_start < alignment2.query_start) lc2 = true;
+                        if (s.query_end > alignment2.query_end) rc2 = true;
+                    }
+                    if (alignment1.is_revcomp) std::swap(lc1, rc1);
+                    if (alignment2.is_revcomp) std::swap(lc2, rc2);
+                    const auto& seq1 = alignment1.is_revcomp ? read1.rc : read1.seq;
+                    auto xk1 = realign_soft_clips(alignment1, seq1, references, aligner, lc1, rc1);
+                    if (!xk1.empty()) {
+                        if (!extra1.empty()) extra1 += '\t';
+                        extra1 += "XK:Z:" + format_xk_tag(xk1);
+                    }
+                    const auto& seq2 = alignment2.is_revcomp ? read2.rc : read2.seq;
+                    auto xk2 = realign_soft_clips(alignment2, seq2, references, aligner, lc2, rc2);
+                    if (!xk2.empty()) {
+                        if (!extra2.empty()) extra2 += '\t';
+                        extra2 += "XK:Z:" + format_xk_tag(xk2);
+                    }
+                }
+
                 // Tag hotspot-realigned reads
                 if (is_near_hotspot) {
                     if (!extra1.empty()) extra1 += '\t';
@@ -2287,6 +1551,33 @@ void align_or_map_paired(
                             extra2 += '\t';
                             extra2 += bp_infos2[0].format_all(references);
                         }
+                    }
+                }
+
+                // XK: soft-clip realignment for short clips
+                if (map_param.sv_tags && !collector) {
+                    bool lc1 = false, rc1 = false, lc2 = false, rc2 = false;
+                    for (const auto& s : si1.supps) {
+                        if (s.query_start < primary1.query_start) lc1 = true;
+                        if (s.query_end > primary1.query_end) rc1 = true;
+                    }
+                    for (const auto& s : si2.supps) {
+                        if (s.query_start < primary2.query_start) lc2 = true;
+                        if (s.query_end > primary2.query_end) rc2 = true;
+                    }
+                    if (primary1.is_revcomp) std::swap(lc1, rc1);
+                    if (primary2.is_revcomp) std::swap(lc2, rc2);
+                    const auto& seq1 = primary1.is_revcomp ? read1.rc : read1.seq;
+                    auto xk1 = realign_soft_clips(primary1, seq1, references, aligner, lc1, rc1);
+                    if (!xk1.empty()) {
+                        if (!extra1.empty()) extra1 += '\t';
+                        extra1 += "XK:Z:" + format_xk_tag(xk1);
+                    }
+                    const auto& seq2 = primary2.is_revcomp ? read2.rc : read2.seq;
+                    auto xk2 = realign_soft_clips(primary2, seq2, references, aligner, lc2, rc2);
+                    if (!xk2.empty()) {
+                        if (!extra2.empty()) extra2 += '\t';
+                        extra2 += "XK:Z:" + format_xk_tag(xk2);
                     }
                 }
 

@@ -59,6 +59,8 @@ add_library(salib STATIC ${SOURCES}
   cpp/paf.cpp
   cpp/pc.cpp
   cpp/aln.cpp
+  cpp/sv_tags.cpp
+  cpp/pair_scoring.cpp
   cpp/cigar.cpp
   cpp/aligner.cpp
   cpp/hits.cpp
@@ -68,6 +70,7 @@ add_library(salib STATIC ${SOURCES}
   cpp/version.cpp
   cpp/io.cpp
   cpp/svhotspot.cpp
+  cpp/clip.cpp
   cpp/insertsizedistribution.cpp
   cpp/iowrap.cpp
   cpp/chain.cpp
