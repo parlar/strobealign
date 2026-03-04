@@ -132,8 +132,9 @@ void Sam::add(
     const KSeq& record,
     const std::string& sequence_rc,
     uint8_t mapq,
-    bool is_primary,
-    const Details& details
+    AlignmentType aln_type,
+    const Details& details,
+    const std::string& extra_tags
 ) {
     assert(!alignment.is_unaligned);
 
@@ -141,11 +142,14 @@ void Sam::add(
     if (!alignment.is_unaligned && alignment.is_revcomp) {
         flags |= REVERSE;
     }
-    if (!is_primary) {
+    if (aln_type == SECONDARY_ALN) {
         flags |= SECONDARY;
         mapq = 0;
     }
-    add_record(record.name, record.comment, flags, references.names[alignment.ref_id], alignment.ref_start, mapq, alignment.cigar, "*", -1, 0, record.seq, sequence_rc, record.qual, alignment.edit_distance, alignment.score, details);
+    if (aln_type == SUPPLEMENTARY_ALN) {
+        flags |= SUPPLEMENTARY;
+    }
+    add_record(record.name, record.comment, flags, references.names[alignment.ref_id], alignment.ref_start, mapq, alignment.cigar, "*", -1, 0, record.seq, sequence_rc, record.qual, alignment.edit_distance, alignment.score, details, extra_tags);
 }
 
 // Add one individual record
@@ -165,7 +169,8 @@ void Sam::add_record(
     const std::string& qual,
     int ed,
     int aln_score,
-    const Details& details
+    const Details& details,
+    const std::string& extra_tags
 ) {
     sam_string.append(strip_suffix(query_name));
     sam_string.append("\t");
@@ -187,7 +192,7 @@ void Sam::add_record(
     sam_string.append(std::to_string(template_len));
     sam_string.append("\t");
 
-    if (flags & SECONDARY) {
+    if (flags & (SECONDARY | SUPPLEMENTARY)) {
         append_seq("");
     } else if (flags & REVERSE) {
         append_seq(query_sequence_rc);
@@ -196,7 +201,7 @@ void Sam::add_record(
     }
 
     if (!(flags & UNMAP)) {
-        if (flags & SECONDARY) {
+        if (flags & (SECONDARY | SUPPLEMENTARY)) {
             append_qual("");
         } else if (flags & REVERSE) {
             auto qual_rev = qual;
@@ -222,6 +227,10 @@ void Sam::add_record(
         }
     }
     append_rg();
+    if (!extra_tags.empty()) {
+        sam_string.append("\t");
+        sam_string.append(extra_tags);
+    }
     if (this->fastq_comments) {
         sam_string.append("\t");
         sam_string.append(comment);
@@ -239,12 +248,14 @@ void Sam::add_pair(
     uint8_t mapq1,
     uint8_t mapq2,
     bool is_proper,
-    bool is_primary,
-    const std::array<Details, 2>& details
+    AlignmentType aln_type,
+    const std::array<Details, 2>& details,
+    const std::string& extra_tags1,
+    const std::string& extra_tags2
 ) {
     int f1 = PAIRED | READ1;
     int f2 = PAIRED | READ2;
-    if (!is_primary) {
+    if (aln_type == SECONDARY_ALN) {
         f1 |= SECONDARY;
         f2 |= SECONDARY;
     }
@@ -320,12 +331,12 @@ void Sam::add_pair(
     if (alignment1.is_unaligned) {
         add_unmapped_mate(record1, f1, reference_name2, pos2);
     } else {
-        add_record(record1.name, record1.comment, f1, reference_name1, alignment1.ref_start, mapq1, alignment1.cigar, mate_reference_name2, pos2, template_len1, record1.seq, read1_rc, record1.qual, edit_distance1, alignment1.score, details[0]);
+        add_record(record1.name, record1.comment, f1, reference_name1, alignment1.ref_start, mapq1, alignment1.cigar, mate_reference_name2, pos2, template_len1, record1.seq, read1_rc, record1.qual, edit_distance1, alignment1.score, details[0], extra_tags1);
     }
     if (alignment2.is_unaligned) {
         add_unmapped_mate(record2, f2, reference_name1, pos1);
     } else {
-        add_record(record2.name, record2.comment, f2, reference_name2, alignment2.ref_start, mapq2, alignment2.cigar, mate_reference_name1, pos1, -template_len1, record2.seq, read2_rc, record2.qual, edit_distance2, alignment2.score, details[1]);
+        add_record(record2.name, record2.comment, f2, reference_name2, alignment2.ref_start, mapq2, alignment2.cigar, mate_reference_name1, pos1, -template_len1, record2.seq, read2_rc, record2.qual, edit_distance2, alignment2.score, details[1], extra_tags2);
     }
 }
 
@@ -345,6 +356,8 @@ std::ostream& operator<<(std::ostream& os, const Alignment& alignment) {
     os
         << "Alignment(ref_id=" << alignment.ref_id
         << ", ref_start=" << alignment.ref_start
+        << ", query_start=" << alignment.query_start
+        << ", query_end=" << alignment.query_end
         << ", cigar=" << alignment.cigar
         << ", edit_distance=" << alignment.edit_distance
         << ", global_ed=" << alignment.global_ed
@@ -355,4 +368,66 @@ std::ostream& operator<<(std::ostream& os, const Alignment& alignment) {
         << ", gapped=" << alignment.gapped
         << ")";
     return os;
+}
+
+std::string Sam::format_sa_entry(const Alignment& alignment, uint8_t mapq) const {
+    std::string entry;
+    entry.append(references.names[alignment.ref_id]);
+    entry.append(",");
+    entry.append(std::to_string(alignment.ref_start + 1));  // 1-based
+    entry.append(",");
+    entry.append(alignment.is_revcomp ? "-" : "+");
+    entry.append(",");
+    entry.append(cigar_string(alignment.cigar));
+    entry.append(",");
+    entry.append(std::to_string(mapq));
+    entry.append(",");
+    entry.append(std::to_string(alignment.edit_distance));
+    entry.append(";");
+    return entry;
+}
+
+void Sam::add_paired_supplementary(
+    const Alignment& alignment,
+    const KSeq& record,
+    const std::string& read_rc,
+    uint8_t mapq,
+    bool is_read1,
+    const Alignment& mate_primary,
+    const Details& details,
+    const std::string& extra_tags
+) {
+    assert(!alignment.is_unaligned);
+
+    int flags = SUPPLEMENTARY | PAIRED;
+    flags |= is_read1 ? READ1 : READ2;
+    if (alignment.is_revcomp) flags |= REVERSE;
+    if (mate_primary.is_unaligned) {
+        flags |= MUNMAP;
+    } else {
+        if (mate_primary.is_revcomp) flags |= MREVERSE;
+    }
+
+    std::string mate_ref;
+    int mate_pos;
+    if (mate_primary.is_unaligned) {
+        mate_ref = "*";
+        mate_pos = -1;
+    } else if (mate_primary.ref_id == alignment.ref_id) {
+        mate_ref = "=";
+        mate_pos = mate_primary.ref_start;
+    } else {
+        mate_ref = references.names[mate_primary.ref_id];
+        mate_pos = mate_primary.ref_start;
+    }
+
+    add_record(
+        record.name, record.comment, flags,
+        references.names[alignment.ref_id], alignment.ref_start,
+        mapq, alignment.cigar, mate_ref, mate_pos,
+        0, // TLEN = 0 for supplementary
+        record.seq, read_rc, record.qual,
+        alignment.edit_distance, alignment.score,
+        details, extra_tags
+    );
 }

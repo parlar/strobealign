@@ -32,6 +32,8 @@ struct CommandLineOptions {
     bool details{false};
     bool fastq_comments{false};
     int max_secondary { 0 };
+    int max_supplementary { 0 };
+    int max_supp_overlap { 50 };
 
     // Seeding
     int r { 150 };

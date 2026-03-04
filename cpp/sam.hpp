@@ -17,6 +17,8 @@ struct Alignment {
     int global_ed{-1};
     int score{0};
     int length{0};
+    int query_start{0};   // 0-based forward-strand coordinate
+    int query_end{0};     // 0-based exclusive forward-strand coordinate
     bool is_revcomp{false};
     bool is_unaligned{false};
     // Whether a gapped alignment function was used to obtain this alignment
@@ -46,6 +48,12 @@ enum struct CigarOps {
     M = 1,    // use M CIGAR operations
 };
 
+enum AlignmentType {
+    PRIMARY,
+    SECONDARY_ALN,
+    SUPPLEMENTARY_ALN,
+};
+
 class Sam {
 
 public:
@@ -73,14 +81,20 @@ public:
         }
 
     /* Add an alignment */
-    void add(const Alignment& alignment, const klibpp::KSeq& record, const std::string& sequence_rc, uint8_t mapq, bool is_primary, const Details& details);
-    void add_pair(const Alignment& alignment1, const Alignment& alignment2, const klibpp::KSeq& record1, const klibpp::KSeq& record2, const std::string& read1_rc, const std::string& read2_rc, uint8_t mapq1, uint8_t mapq2, bool is_proper, bool is_primary, const std::array<Details, 2>& details);
+    void add(const Alignment& alignment, const klibpp::KSeq& record, const std::string& sequence_rc, uint8_t mapq, AlignmentType aln_type, const Details& details, const std::string& extra_tags = "");
+    void add_pair(const Alignment& alignment1, const Alignment& alignment2, const klibpp::KSeq& record1, const klibpp::KSeq& record2, const std::string& read1_rc, const std::string& read2_rc, uint8_t mapq1, uint8_t mapq2, bool is_proper, AlignmentType aln_type, const std::array<Details, 2>& details, const std::string& extra_tags1 = "", const std::string& extra_tags2 = "");
+
+    /* Format an SA tag entry for one alignment: rname,pos,strand,CIGAR,MAPQ,NM; */
+    std::string format_sa_entry(const Alignment& alignment, uint8_t mapq) const;
+
+    /* Add a supplementary alignment for one read of a pair */
+    void add_paired_supplementary(const Alignment& alignment, const klibpp::KSeq& record, const std::string& read_rc, uint8_t mapq, bool is_read1, const Alignment& mate_primary, const Details& details, const std::string& extra_tags = "");
     void add_unmapped(const klibpp::KSeq& record, uint16_t flags = UNMAP);
     void add_unmapped_pair(const klibpp::KSeq& r1, const klibpp::KSeq& r2);
     void add_unmapped_mate(const klibpp::KSeq& record, uint16_t flags, const std::string& mate_reference_name, uint32_t mate_pos);
 
 private:
-    void add_record(const std::string& query_name, const std::string& comment, uint16_t flags, const std::string& reference_name, uint32_t pos, uint8_t mapq, const Cigar& cigar, const std::string& mate_reference_name, uint32_t mate_pos, int32_t template_len, const std::string& query_sequence, const std::string& query_sequence_rc, const std::string& qual, int ed, int aln_score, const Details& details);
+    void add_record(const std::string& query_name, const std::string& comment, uint16_t flags, const std::string& reference_name, uint32_t pos, uint8_t mapq, const Cigar& cigar, const std::string& mate_reference_name, uint32_t mate_pos, int32_t template_len, const std::string& query_sequence, const std::string& query_sequence_rc, const std::string& qual, int ed, int aln_score, const Details& details, const std::string& extra_tags = "");
 
     void append_seq(const std::string& seq) {
         sam_string.append(seq.empty() ? "*" : seq);

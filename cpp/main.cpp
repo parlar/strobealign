@@ -192,6 +192,8 @@ int run_strobealign(int argc, char **argv) {
     MappingParameters map_param;
     map_param.r = opt.r;
     map_param.max_secondary = opt.max_secondary;
+    map_param.max_supplementary = opt.max_supplementary;
+    map_param.max_supp_overlap = opt.max_supp_overlap;
     map_param.dropoff_threshold = opt.dropoff_threshold;
     map_param.rescue_threshold = opt.rescue_threshold;
     map_param.max_tries = opt.max_tries;

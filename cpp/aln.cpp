@@ -1,6 +1,7 @@
 #include "aln.hpp"
 
 #include <algorithm>
+#include <numeric>
 #include <math.h>
 #include "chain.hpp"
 #include "revcomp.hpp"
@@ -16,6 +17,55 @@ static Logger& logger = Logger::get();
 
 
 namespace {
+
+/*
+ * Given a primary alignment and a list of candidate alignments, select
+ * supplementary alignments that cover different query regions.
+ * Candidates that overlap the primary (or previously accepted supplementary)
+ * query region by more than max_supp_overlap bp are rejected.
+ * Candidates whose entire aligned query region is already covered are also
+ * rejected.
+ */
+std::vector<Alignment> select_supplementary(
+    const Alignment& primary,
+    const std::vector<Alignment>& candidates,
+    unsigned max_supplementary,
+    int max_supp_overlap
+) {
+    std::vector<Alignment> supplementaries;
+    if (max_supplementary == 0 || candidates.empty()) return supplementaries;
+
+    // Sort candidates by score (descending)
+    std::vector<size_t> indices(candidates.size());
+    std::iota(indices.begin(), indices.end(), 0);
+    std::sort(indices.begin(), indices.end(),
+        [&](size_t a, size_t b) { return candidates[a].score > candidates[b].score; });
+
+    // Track covered query regions (start with primary)
+    std::vector<std::pair<int, int>> covered;
+    covered.push_back({primary.query_start, primary.query_end});
+
+    for (size_t idx : indices) {
+        if (supplementaries.size() >= max_supplementary) break;
+        const auto& cand = candidates[idx];
+        int cand_len = cand.query_end - cand.query_start;
+        if (cand_len <= 0) continue;
+
+        bool too_much_overlap = false;
+        for (const auto& [cov_start, cov_end] : covered) {
+            int overlap = std::max(0, std::min(cand.query_end, cov_end) - std::max(cand.query_start, cov_start));
+            if (overlap > max_supp_overlap || overlap >= cand_len) {
+                too_much_overlap = true;
+                break;
+            }
+        }
+        if (!too_much_overlap) {
+            supplementaries.push_back(cand);
+            covered.push_back({cand.query_start, cand.query_end});
+        }
+    }
+    return supplementaries;
+}
 
 struct NamPair {
     float score;
@@ -99,6 +149,8 @@ inline void align_single(
     float dropoff_threshold,
     int max_tries,
     unsigned max_secondary,
+    unsigned max_supplementary,
+    int max_supp_overlap,
     std::minstd_rand& random_engine
 ) {
     if (nams.empty()) {
@@ -120,6 +172,8 @@ inline void align_single(
     Alignment best_alignment;
     best_alignment.is_unaligned = true;
 
+    const bool collect_alignments = max_secondary > 0 || max_supplementary > 0;
+
     for (auto &nam : nams) {
         float score_dropoff = (float) nam.score / n_max.score;
         if (tries >= max_tries || (tries > 1 && best_edit_distance == 0) || score_dropoff < dropoff_threshold) {
@@ -135,7 +189,7 @@ inline void align_single(
         }
         details.gapped += alignment.gapped;
 
-        if (max_secondary > 0) {
+        if (collect_alignments) {
             alignments.emplace_back(alignment);
         }
 
@@ -147,10 +201,7 @@ inline void align_single(
                 update_best = true;
             } else {
                 assert(alignment.score == best_score);
-                // Two or more alignments have the same best score - count them
                 alignments_with_best_score++;
-
-                // Pick one randomly using reservoir sampling
                 std::uniform_int_distribution<> distrib(1, alignments_with_best_score);
                 if (distrib(random_engine) == 1) {
                     update_best = true;
@@ -159,8 +210,8 @@ inline void align_single(
             if (update_best) {
                 best_score = alignment.score;
                 best_alignment = std::move(alignment);
-                best_index = tries;
-                if (max_secondary == 0) {
+                best_index = collect_alignments ? alignments.size() - 1 : tries;
+                if (!collect_alignments) {
                     best_edit_distance = best_alignment.global_ed;
                 }
             }
@@ -175,16 +226,64 @@ inline void align_single(
     }
     details.best_alignments = alignments_with_best_score;
     uint8_t mapq = (60.0 * (best_score - second_best_score) + best_score - 1) / best_score;
-    bool is_primary = true;
-    sam.add(best_alignment, record, read.rc, mapq, is_primary, details);
 
-    if (max_secondary == 0) {
+    // Detect supplementary alignments before outputting primary (SA tag on
+    // primary must reference all supplementaries).
+    // select_supplementary() naturally skips the primary itself because its
+    // query region is already in the covered set, so overlap >= cand_len.
+    std::vector<Alignment> supplementaries;
+
+    if (max_supplementary > 0 && alignments.size() > 1) {
+        supplementaries = select_supplementary(best_alignment, alignments, max_supplementary, max_supp_overlap);
+    }
+
+    // Build SA tags if supplementaries were found
+    std::string primary_sa_tag;
+    std::vector<std::string> supp_sa_tags;
+
+    if (!supplementaries.empty()) {
+        std::string primary_entry = sam.format_sa_entry(best_alignment, mapq);
+
+        // Build SA entries for each supplementary
+        std::vector<std::string> supp_entries;
+        for (const auto& s : supplementaries) {
+            supp_entries.push_back(sam.format_sa_entry(s, mapq));
+        }
+
+        // Primary's SA tag = all supplementary entries
+        primary_sa_tag = "SA:Z:";
+        for (const auto& e : supp_entries) {
+            primary_sa_tag.append(e);
+        }
+
+        // Each supplementary's SA tag = primary + other supplementary entries
+        for (size_t i = 0; i < supplementaries.size(); ++i) {
+            std::string tag = "SA:Z:";
+            tag.append(primary_entry);
+            for (size_t j = 0; j < supplementaries.size(); ++j) {
+                if (j != i) {
+                    tag.append(supp_entries[j]);
+                }
+            }
+            supp_sa_tags.push_back(tag);
+        }
+    }
+
+    // Output primary alignment (with SA tag if supplementaries exist)
+    sam.add(best_alignment, record, read.rc, mapq, PRIMARY, details, primary_sa_tag);
+
+    // Output supplementary alignments
+    for (size_t i = 0; i < supplementaries.size(); ++i) {
+        sam.add(supplementaries[i], record, read.rc, mapq, SUPPLEMENTARY_ALN, details, supp_sa_tags[i]);
+    }
+
+    if (max_secondary == 0 || alignments.empty()) {
         return;
     }
 
     // Secondary alignments
 
-    // Remove the alignment that was already output
+    // Remove the primary alignment
     if (alignments.size() > 1) {
         std::swap(alignments[best_index], alignments[alignments.size() - 1]);
     }
@@ -192,22 +291,26 @@ inline void align_single(
 
     // Sort remaining alignments by score, highest first
     std::sort(alignments.begin(), alignments.end(),
-        [](const Alignment& a, const Alignment& b) -> bool {
-            return a.score > b.score;
-        }
-    );
+        [](const Alignment& a, const Alignment& b) { return a.score > b.score; });
 
-    // Output secondary alignments
+    // Output secondary alignments (skip those already output as supplementary)
+    double secondary_dropoff = 2 * aligner.parameters.mismatch + aligner.parameters.gap_open;
     size_t n = 0;
-    for (const auto& alignment : alignments) {
-        if (
-            n >= max_secondary
-            || alignment.score - best_score > 2*aligner.parameters.mismatch + aligner.parameters.gap_open
-        ) {
+    for (const auto& aln : alignments) {
+        if (n >= max_secondary || best_score - aln.score > secondary_dropoff) {
             break;
         }
-        bool is_primary = false;
-        sam.add(alignment, record, read.rc, mapq, is_primary, details);
+        // Skip alignments already emitted as supplementary
+        bool is_supp = false;
+        for (const auto& s : supplementaries) {
+            if (aln.ref_id == s.ref_id && aln.ref_start == s.ref_start
+                && aln.query_start == s.query_start && aln.query_end == s.query_end) {
+                is_supp = true;
+                break;
+            }
+        }
+        if (is_supp) continue;
+        sam.add(aln, record, read.rc, mapq, SECONDARY_ALN, details);
         n++;
     }
 }
@@ -277,7 +380,90 @@ inline Alignment extend_seed(
     alignment.ref_id = nam.ref_id;
     alignment.gapped = gapped;
 
+    // Convert query coordinates to forward-strand
+    if (nam.is_revcomp) {
+        int read_len = static_cast<int>(query.size());
+        alignment.query_start = read_len - info.query_end;
+        alignment.query_end = read_len - info.query_start;
+    } else {
+        alignment.query_start = info.query_start;
+        alignment.query_end = info.query_end;
+    }
+
     return alignment;
+}
+
+struct ReadSupplementaryInfo {
+    std::vector<Alignment> supps;
+    std::string primary_sa_tag;  // SA tag for the primary record
+    std::vector<std::string> supp_sa_tags;  // SA tag for each supplementary record
+};
+
+/*
+ * Detect supplementary alignments for one read by aligning its NAMs,
+ * then build SA tags linking primary and supplementary records.
+ */
+ReadSupplementaryInfo build_supplementary_info(
+    Sam& sam,
+    const Aligner& aligner,
+    std::vector<Nam>& nams,
+    const Read& read,
+    const Alignment& primary,
+    uint8_t mapq,
+    int k,
+    const References& references,
+    float dropoff_threshold,
+    unsigned max_tries,
+    unsigned max_supplementary,
+    int max_supp_overlap
+) {
+    ReadSupplementaryInfo info;
+    if (max_supplementary == 0 || nams.empty() || primary.is_unaligned) {
+        return info;
+    }
+
+    // Build candidate alignments from NAMs
+    std::vector<Alignment> candidates;
+    auto n_max_score = nams[0].score;
+    unsigned tries = 0;
+    for (auto& nam : nams) {
+        if (tries >= max_tries) break;
+        float score_dropoff = (float)nam.score / n_max_score;
+        if (tries > 1 && score_dropoff < dropoff_threshold) break;
+
+        bool consistent = reverse_nam_if_needed(nam, read, references, k);
+        auto aln = extend_seed(aligner, nam, references, read, consistent);
+        if (!aln.is_unaligned) {
+            candidates.push_back(aln);
+        }
+        tries++;
+    }
+
+    info.supps = select_supplementary(primary, candidates, max_supplementary, max_supp_overlap);
+    if (info.supps.empty()) return info;
+
+    // Build SA tags
+    std::string primary_entry = sam.format_sa_entry(primary, mapq);
+    std::vector<std::string> supp_entries;
+    for (auto& s : info.supps) {
+        supp_entries.push_back(sam.format_sa_entry(s, mapq));
+    }
+
+    info.primary_sa_tag = "SA:Z:";
+    for (auto& e : supp_entries) {
+        info.primary_sa_tag.append(e);
+    }
+
+    for (size_t i = 0; i < info.supps.size(); ++i) {
+        std::string tag = "SA:Z:";
+        tag.append(primary_entry);
+        for (size_t j = 0; j < info.supps.size(); ++j) {
+            if (j != i) tag.append(supp_entries[j]);
+        }
+        info.supp_sa_tags.push_back(tag);
+    }
+
+    return info;
 }
 
 /*
@@ -513,6 +699,16 @@ inline Alignment rescue_align(
         alignment.ref_id = mate_nam.ref_id;
         alignment.is_unaligned = info.cigar.empty();
         alignment.length = info.ref_span();
+
+        // Convert query coordinates to forward-strand
+        if (alignment.is_revcomp) {
+            int read_len = static_cast<int>(read.size());
+            alignment.query_start = read_len - info.query_end;
+            alignment.query_end = read_len - info.query_start;
+        } else {
+            alignment.query_start = info.query_start;
+            alignment.query_end = info.query_end;
+        }
     } else {
         alignment.is_unaligned = true;
         alignment.edit_distance = 100000;
@@ -653,10 +849,10 @@ void output_aligned_pairs(
         Alignment alignment1 = best_aln_pair.alignment1;
         Alignment alignment2 = best_aln_pair.alignment2;
 
-        sam.add_pair(alignment1, alignment2, record1, record2, read1.rc, read2.rc, mapq1, mapq2, is_proper_pair(alignment1, alignment2, mu, sigma), true, details);
+        sam.add_pair(alignment1, alignment2, record1, record2, read1.rc, read2.rc, mapq1, mapq2, is_proper_pair(alignment1, alignment2, mu, sigma), PRIMARY, details);
     } else {
         auto max_out = std::min(high_scores.size(), max_secondary);
-        bool is_primary = true;
+        AlignmentType aln_type = PRIMARY;
         float s_max = best_aln_pair.score;
         for (size_t i = 0; i < max_out; ++i) {
             auto aln_pair = high_scores[i];
@@ -664,13 +860,13 @@ void output_aligned_pairs(
             Alignment alignment2 = aln_pair.alignment2;
             float s_score = aln_pair.score;
             if (i > 0) {
-                is_primary = false;
+                aln_type = SECONDARY_ALN;
                 mapq1 = 0;
                 mapq2 = 0;
             }
             if (s_max - s_score < secondary_dropoff) {
                 bool is_proper = is_proper_pair(alignment1, alignment2, mu, sigma);
-                sam.add_pair(alignment1, alignment2, record1, record2, read1.rc, read2.rc, mapq1, mapq2, is_proper, is_primary, details);
+                sam.add_pair(alignment1, alignment2, record1, record2, read1.rc, read2.rc, mapq1, mapq2, is_proper, aln_type, details);
             } else {
                 break;
             }
@@ -1155,8 +1351,23 @@ void align_or_map_paired(
 
             details[0].best_alignments = 1;
             details[1].best_alignments = 1;
-            bool is_primary = true;
-            sam.add_pair(alignment1, alignment2, record1, record2, read1.rc, read2.rc, mapq1, mapq2, is_proper, is_primary, details);
+
+            if (map_param.max_supplementary > 0) {
+                auto k = index_parameters.syncmer.k;
+                auto si1 = build_supplementary_info(sam, aligner, nams_pair[0], read1, alignment1, mapq1, k, references, map_param.dropoff_threshold, map_param.max_tries, map_param.max_supplementary, map_param.max_supp_overlap);
+                auto si2 = build_supplementary_info(sam, aligner, nams_pair[1], read2, alignment2, mapq2, k, references, map_param.dropoff_threshold, map_param.max_tries, map_param.max_supplementary, map_param.max_supp_overlap);
+
+                sam.add_pair(alignment1, alignment2, record1, record2, read1.rc, read2.rc, mapq1, mapq2, is_proper, PRIMARY, details, si1.primary_sa_tag, si2.primary_sa_tag);
+
+                for (size_t j = 0; j < si1.supps.size(); ++j) {
+                    sam.add_paired_supplementary(si1.supps[j], record1, read1.rc, mapq1, true, alignment2, details[0], si1.supp_sa_tags[j]);
+                }
+                for (size_t j = 0; j < si2.supps.size(); ++j) {
+                    sam.add_paired_supplementary(si2.supps[j], record2, read2.rc, mapq2, false, alignment1, details[1], si2.supp_sa_tags[j]);
+                }
+            } else {
+                sam.add_pair(alignment1, alignment2, record1, record2, read1.rc, read2.rc, mapq1, mapq2, is_proper, PRIMARY, details);
+            }
         } else {
             std::sort(alignment_pairs.begin(), alignment_pairs.end(), by_score<ScoredAlignmentPair>);
             deduplicate_scored_pairs(alignment_pairs);
@@ -1173,20 +1384,55 @@ void align_or_map_paired(
                 }
             }
 
-            double secondary_dropoff = 2 * aligner.parameters.mismatch + aligner.parameters.gap_open;
-            output_aligned_pairs(
-                alignment_pairs,
-                sam,
-                map_param.max_secondary,
-                secondary_dropoff,
-                record1,
-                record2,
-                read1,
-                read2,
-                isize_est.mu,
-                isize_est.sigma,
-                details
-            );
+            if (map_param.max_supplementary > 0 && !alignment_pairs.empty()) {
+                // Detect supplementaries for each read, then output
+                // primary pair with SA tags, supplementaries, and secondaries
+                auto [mapq1, mapq2] = joint_mapq_from_high_scores(alignment_pairs);
+                auto& primary1 = alignment_pairs[0].alignment1;
+                auto& primary2 = alignment_pairs[0].alignment2;
+                bool is_proper = is_proper_pair(primary1, primary2, isize_est.mu, isize_est.sigma);
+
+                auto k = index_parameters.syncmer.k;
+                auto si1 = build_supplementary_info(sam, aligner, nams_pair[0], read1, primary1, mapq1, k, references, map_param.dropoff_threshold, map_param.max_tries, map_param.max_supplementary, map_param.max_supp_overlap);
+                auto si2 = build_supplementary_info(sam, aligner, nams_pair[1], read2, primary2, mapq2, k, references, map_param.dropoff_threshold, map_param.max_tries, map_param.max_supplementary, map_param.max_supp_overlap);
+
+                // Output primary pair with SA tags
+                sam.add_pair(primary1, primary2, record1, record2, read1.rc, read2.rc, mapq1, mapq2, is_proper, PRIMARY, details, si1.primary_sa_tag, si2.primary_sa_tag);
+
+                // Output supplementary records
+                for (size_t j = 0; j < si1.supps.size(); ++j) {
+                    sam.add_paired_supplementary(si1.supps[j], record1, read1.rc, mapq1, true, primary2, details[0], si1.supp_sa_tags[j]);
+                }
+                for (size_t j = 0; j < si2.supps.size(); ++j) {
+                    sam.add_paired_supplementary(si2.supps[j], record2, read2.rc, mapq2, false, primary1, details[1], si2.supp_sa_tags[j]);
+                }
+
+                // Output secondary pairs
+                double secondary_dropoff = 2 * aligner.parameters.mismatch + aligner.parameters.gap_open;
+                auto max_out = std::min(alignment_pairs.size(), static_cast<size_t>(map_param.max_secondary) + 1);
+                auto s_max = alignment_pairs[0].score;
+                for (size_t j = 1; j < max_out; ++j) {
+                    auto& pair = alignment_pairs[j];
+                    if (s_max - pair.score >= secondary_dropoff) break;
+                    bool sec_proper = is_proper_pair(pair.alignment1, pair.alignment2, isize_est.mu, isize_est.sigma);
+                    sam.add_pair(pair.alignment1, pair.alignment2, record1, record2, read1.rc, read2.rc, 0, 0, sec_proper, SECONDARY_ALN, details);
+                }
+            } else {
+                double secondary_dropoff = 2 * aligner.parameters.mismatch + aligner.parameters.gap_open;
+                output_aligned_pairs(
+                    alignment_pairs,
+                    sam,
+                    map_param.max_secondary,
+                    secondary_dropoff,
+                    record1,
+                    record2,
+                    read1,
+                    read2,
+                    isize_est.mu,
+                    isize_est.sigma,
+                    details
+                );
+            }
         }
     }
     statistics.tot_extend += extend_timer.duration();
@@ -1248,7 +1494,8 @@ void align_or_map_single(
             align_single(
                 aligner, sam, nams, record, index_parameters.syncmer.k,
                 references, details, map_param.dropoff_threshold, map_param.max_tries,
-                map_param.max_secondary, random_engine
+                map_param.max_secondary, map_param.max_supplementary,
+                map_param.max_supp_overlap, random_engine
             );
             break;
     }
