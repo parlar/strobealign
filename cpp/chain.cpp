@@ -120,26 +120,29 @@ float Chainer::collinear_chaining(
     float best_score = 0;
     int best_index = -1;
 
-    int lookup_end = 0;
-    for (size_t i = 1; i < n; ++i) {
-        lookup_end = std::max(lookup_end, static_cast<int>(i) - chaining_params.max_lookback);
+    for (size_t i = 0; i < n; ++i) {
+        const int lookup_end = std::max(0, static_cast<int>(i) - chaining_params.max_lookback);
         const Anchor& ai = anchors[i];
-        if (ai.ref_id != anchors[i-1].ref_id || ai.ref_start - anchors[i-1].ref_start >= chaining_params.max_ref_gap) {
-            lookup_end = i;
-            continue;
-        }
 
         for (int j = i - 1; j >= lookup_end; --j) {
             const Anchor& aj = anchors[j];
+
+            if (ai.ref_id != aj.ref_id) {
+                break;
+            }
+
             const int dq = ai.query_start - aj.query_start;
             const int dr = ai.ref_start - aj.ref_start;
 
+            if (dr >= chaining_params.max_ref_gap) {
+                break;
+            }
             if (dq <= 0 || dr <= 0) {
-                // Not collinear
                 continue;
             }
 
             const float score = compute_score(dq, dr);
+
             const float new_score = dp[j] + score;
             if (new_score >= dp[i]) {
                 dp[i] = new_score;

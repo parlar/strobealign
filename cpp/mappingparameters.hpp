@@ -16,7 +16,7 @@ struct ChainingParameters {
     float diag_diff_penalty;
     float gap_length_penalty;
     float valid_score_threshold;
-    uint max_ref_gap;
+    int max_ref_gap;
     float matches_weight;
 };
 
