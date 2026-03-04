@@ -95,7 +95,7 @@ void Sam::add_unmapped(const KSeq& record, uint16_t flags) {
 }
 
 void Sam::add_unmapped_mate(const KSeq& record, uint16_t flags, const std::string& mate_reference_name, uint32_t mate_pos) {
-    assert(flags & (UNMAP|PAIRED));
+    assert((flags & UNMAP) && (flags & PAIRED));
     sam_string.append(strip_suffix(record.name));
     sam_string.append("\t");
     sam_string.append(std::to_string(flags));

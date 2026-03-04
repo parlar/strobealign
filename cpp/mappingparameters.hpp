@@ -42,6 +42,12 @@ struct MappingParameters {
         if (max_tries < 1) {
             throw BadParameter("max_tries must be greater than zero");
         }
+        if (max_supplementary < 0) {
+            throw BadParameter("--supp must be non-negative");
+        }
+        if (max_supp_overlap < 0) {
+            throw BadParameter("--supp-overlap must be non-negative");
+        }
     }
 };
 

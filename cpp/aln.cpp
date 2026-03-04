@@ -211,9 +211,7 @@ inline void align_single(
                 best_score = alignment.score;
                 best_alignment = std::move(alignment);
                 best_index = collect_alignments ? alignments.size() - 1 : tries;
-                if (!collect_alignments) {
-                    best_edit_distance = best_alignment.global_ed;
-                }
+                best_edit_distance = best_alignment.global_ed;
             }
         } else if (alignment.score > second_best_score) {
             second_best_score = alignment.score;
@@ -729,10 +727,9 @@ inline Alignment rescue_align(
         alignment.edit_distance = read_len;
         alignment.score = 0;
         alignment.ref_start =  0;
-        alignment.is_revcomp = mate_nam.is_revcomp;
+        alignment.is_revcomp = !mate_nam.is_revcomp;
         alignment.ref_id = mate_nam.ref_id;
         alignment.is_unaligned = true;
-//        std::cerr << "RESCUE: Caught Bug3! ref start: " << ref_start << " ref end: " << ref_end << " ref len:  " << ref_len << std::endl;
         return alignment;
     }
     std::string ref_segm = references.sequences[mate_nam.ref_id].substr(ref_start, ref_end - ref_start);
@@ -742,7 +739,7 @@ inline Alignment rescue_align(
         alignment.edit_distance = read_len;
         alignment.score = 0;
         alignment.ref_start =  0;
-        alignment.is_revcomp = mate_nam.is_revcomp;
+        alignment.is_revcomp = !mate_nam.is_revcomp;
         alignment.ref_id = mate_nam.ref_id;
         alignment.is_unaligned = true;
         return alignment;
@@ -1461,7 +1458,7 @@ void align_or_map_paired(
                     if (!a1.is_unaligned) {
                         bool found = false;
                         for (const auto& c : candidates1) {
-                            if (c.ref_id == a1.ref_id && c.ref_start == a1.ref_start) { found = true; break; }
+                            if (c.ref_id == a1.ref_id && c.ref_start == a1.ref_start && c.is_revcomp == a1.is_revcomp) { found = true; break; }
                         }
                         if (!found) candidates1.push_back(a1);
                     }
@@ -1469,7 +1466,7 @@ void align_or_map_paired(
                     if (!a2.is_unaligned) {
                         bool found = false;
                         for (const auto& c : candidates2) {
-                            if (c.ref_id == a2.ref_id && c.ref_start == a2.ref_start) { found = true; break; }
+                            if (c.ref_id == a2.ref_id && c.ref_start == a2.ref_start && c.is_revcomp == a2.is_revcomp) { found = true; break; }
                         }
                         if (!found) candidates2.push_back(a2);
                     }
