@@ -1,6 +1,7 @@
 #include "clip.hpp"
 
 #include <algorithm>
+#include <cctype>
 #include <cstdio>
 #include <cmath>
 
@@ -16,7 +17,7 @@ std::pair<int, int> hamming_scan(const std::string& clip, const std::string& ref
     for (int pos = 0; pos <= wlen - clen; pos++) {
         int mm = 0;
         for (int i = 0; i < clen; i++) {
-            if (clip[i] != ref_window[pos + i]) {
+            if (std::toupper(clip[i]) != std::toupper(ref_window[pos + i])) {
                 mm++;
             }
         }
@@ -104,7 +105,7 @@ std::optional<ClipRealignment> try_realign_clip(
                 for (int i = 0; i < len; i++) {
                     if (q_pos + i < static_cast<int>(clip_seq.size())
                         && r_pos + i < static_cast<int>(refine_window.size())
-                        && clip_seq[q_pos + i] == refine_window[r_pos + i]) {
+                        && std::toupper(clip_seq[q_pos + i]) == std::toupper(refine_window[r_pos + i])) {
                         matches++;
                     }
                 }

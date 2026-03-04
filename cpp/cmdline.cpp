@@ -50,6 +50,7 @@ CommandLineOptions parse_command_line_arguments(int argc, char **argv) {
     args::ValueFlag<int> min_clip(parser, "INT", "Min soft-clip length (bp) to trigger supplementary search [15]", {"min-clip"});
     args::Flag sv_tags(parser, "sv-tags", "Add SV-related SAM tags (YT, YD, Xr, YS)", {"sv-tags"});
     args::Flag two_pass(parser, "two-pass", "Two-pass mode: collect SV evidence, then realign reads near hotspots with relaxed parameters", {"two-pass"});
+    args::ValueFlag<std::string> phase_vcf(parser, "FILE", "Phased VCF file for haplotype assignment (HP/PS tags)", {"phase-vcf"});
 
     args::Group seeding_group(parser, "Seeding:");
     auto seeding = SeedingArguments{parser};
@@ -145,6 +146,7 @@ CommandLineOptions parse_command_line_arguments(int argc, char **argv) {
         opt.sv_tags = true;
         if (opt.max_supplementary < 2) { opt.max_supplementary = 2; }
     }
+    if (phase_vcf) { opt.phase_vcf = args::get(phase_vcf); }
 
     // Seeding
     if (seeding.r) { opt.r = args::get(seeding.r); opt.r_set = true; }

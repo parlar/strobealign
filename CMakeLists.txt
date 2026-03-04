@@ -61,6 +61,7 @@ add_library(salib STATIC ${SOURCES}
   cpp/aln.cpp
   cpp/sv_tags.cpp
   cpp/pair_scoring.cpp
+  cpp/phasing.cpp
   cpp/cigar.cpp
   cpp/aligner.cpp
   cpp/hits.cpp

@@ -71,4 +71,19 @@ std::string build_sv_tags(
     float mu, float sigma,
     const Details& details, bool is_fast_path);
 
+struct XuPosteriors {
+    float ref;
+    float sv;
+    float rpt;
+};
+
+XuPosteriors compute_xu_posteriors(
+    float score_ratio,
+    float artifact_prob,
+    float entropy,
+    float mappability,
+    int tied_count);
+
+std::string format_xu_tag(const XuPosteriors& xu);
+
 #endif

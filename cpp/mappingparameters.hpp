@@ -38,6 +38,7 @@ struct MappingParameters {
     bool fastq_comments{false};
 
     bool sv_tags{false};
+    float rescue_sigma_mult{5.0f};
     bool use_nams{false};
     ChainingParameters chaining_params;
 

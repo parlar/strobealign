@@ -4,6 +4,7 @@
 #include <cmath>
 #include <cstdio>
 #include <numeric>
+#include <tuple>
 #include <math.h>
 #include "chain.hpp"
 #include "clip.hpp"
@@ -31,14 +32,15 @@ namespace {
  * Candidates whose entire aligned query region is already covered are also
  * rejected.
  */
-std::vector<Alignment> select_supplementary(
+std::pair<std::vector<Alignment>, std::vector<int>> select_supplementary(
     const Alignment& primary,
     const std::vector<Alignment>& candidates,
     unsigned max_supplementary,
     int max_supp_overlap
 ) {
     std::vector<Alignment> supplementaries;
-    if (max_supplementary == 0 || candidates.empty()) return supplementaries;
+    std::vector<int> tied_counts;
+    if (max_supplementary == 0 || candidates.empty()) return {supplementaries, tied_counts};
 
     // Sort candidates by score (descending)
     std::vector<size_t> indices(candidates.size());
@@ -65,11 +67,30 @@ std::vector<Alignment> select_supplementary(
             }
         }
         if (!too_much_overlap) {
+            // Count how many other candidates with the same score would also
+            // pass the overlap check (i.e. are true alternative placements)
+            int tied = 0;
+            for (size_t j : indices) {
+                if (j == idx || candidates[j].score != cand.score) continue;
+                const auto& other = candidates[j];
+                int other_len = other.query_end - other.query_start;
+                if (other_len <= 0) continue;
+                bool other_overlaps = false;
+                for (const auto& [cov_start, cov_end] : covered) {
+                    int ov = std::max(0, std::min(other.query_end, cov_end) - std::max(other.query_start, cov_start));
+                    if (ov > max_supp_overlap || ov >= other_len) {
+                        other_overlaps = true;
+                        break;
+                    }
+                }
+                if (!other_overlaps) tied++;
+            }
             supplementaries.push_back(cand);
+            tied_counts.push_back(tied);
             covered.push_back({cand.query_start, cand.query_end});
         }
     }
-    return supplementaries;
+    return {supplementaries, tied_counts};
 }
 
 inline Alignment extend_seed(
@@ -79,6 +100,8 @@ inline Alignment extend_seed(
     const Read& read,
     bool consistent_nam
 );
+
+bool has_significant_soft_clip(const Alignment& primary, int read_len, int min_clip);
 
 /*
  * Determine whether the NAM represents a match to the forward or
@@ -141,7 +164,9 @@ inline void align_single(
     std::minstd_rand& random_engine,
     bool sv_tags = false,
     SvEvidenceCollector* collector = nullptr,
-    bool is_near_hotspot = false
+    bool is_near_hotspot = false,
+    const PhasingMap* phasing_map = nullptr,
+    int min_clip = 15
 ) {
     if (nams.empty()) {
         sam.add_unmapped(record);
@@ -220,9 +245,11 @@ inline void align_single(
     // select_supplementary() naturally skips the primary itself because its
     // query region is already in the covered set, so overlap >= cand_len.
     std::vector<Alignment> supplementaries;
+    std::vector<int> supp_tied_counts;
 
-    if (max_supplementary > 0 && alignments.size() > 1) {
-        supplementaries = select_supplementary(best_alignment, alignments, max_supplementary, max_supp_overlap);
+    if (max_supplementary > 0 && alignments.size() > 1
+        && has_significant_soft_clip(best_alignment, record.seq.size(), min_clip)) {
+        std::tie(supplementaries, supp_tied_counts) = select_supplementary(best_alignment, alignments, max_supplementary, max_supp_overlap);
     }
 
     // Build SA tags if supplementaries were found
@@ -271,26 +298,33 @@ inline void align_single(
         }
     }
 
-    // SV tags: XD/XR/XE/XF + YS + breakpoint tags (--sv-tags only, skip in pass 1)
+    // SV tags: XD/XR/XE/XF/XU + YS + breakpoint tags (--sv-tags only, skip in pass 1)
     std::vector<BreakpointInfo> bp_infos;
     if (sv_tags && !supplementaries.empty() && !collector) {
-        auto dt = compute_supp_delta_tags(best_alignment, supplementaries);
-        if (!dt.empty()) {
-            if (!extra_tags.empty()) extra_tags += '\t';
-            extra_tags += dt;
+        // XD/XR: score delta and ratio between primary and best supplementary
+        float score_ratio = 0.0f;
+        {
+            auto dt = compute_supp_delta_tags(best_alignment, supplementaries);
+            if (!dt.empty()) {
+                if (!extra_tags.empty()) extra_tags += '\t';
+                extra_tags += dt;
+            }
+            if (best_alignment.score > 0 && !supplementaries.empty()) {
+                score_ratio = static_cast<float>(supplementaries[0].score) / best_alignment.score;
+            }
         }
         // XE: split chain entropy over all alignments
+        float xe = compute_split_entropy(alignments);
         {
             char buf[32];
-            float xe = compute_split_entropy(alignments);
             std::snprintf(buf, sizeof(buf), "XE:f:%.3f", xe);
             if (!extra_tags.empty()) extra_tags += '\t';
             extra_tags += buf;
         }
         // XF: max artifact probability across supplementaries
+        float xf = compute_max_artifact_prob(best_alignment, supplementaries, record.seq.length());
         {
             char buf[32];
-            float xf = compute_max_artifact_prob(best_alignment, supplementaries, record.seq.length());
             std::snprintf(buf, sizeof(buf), "XF:f:%.2f", xf);
             if (!extra_tags.empty()) extra_tags += '\t';
             extra_tags += buf;
@@ -312,6 +346,19 @@ inline void align_single(
         if (!bp_infos.empty()) {
             extra_tags += '\t';
             extra_tags += bp_infos[0].format_all(references);
+        }
+        // XU: REF/SV/RPT posteriors
+        {
+            int max_tied = 0;
+            for (int tc : supp_tied_counts) {
+                if (tc > max_tied) max_tied = tc;
+            }
+            float total_hits = static_cast<float>(details.hits.total_hits());
+            float filtered_hits = static_cast<float>(details.hits.total_filtered());
+            float mappability = total_hits > 0 ? 1.0f - (filtered_hits / total_hits) : 1.0f;
+            auto xu = compute_xu_posteriors(score_ratio, xf, xe, mappability, max_tied);
+            if (!extra_tags.empty()) extra_tags += '\t';
+            extra_tags += format_xu_tag(xu);
         }
     }
 
@@ -374,6 +421,15 @@ inline void align_single(
         }
     }
 
+    // HP/PS: haplotype phasing
+    if (phasing_map && !best_alignment.is_unaligned) {
+        auto phase = phasing_map->assign_haplotype(best_alignment, record.seq, best_alignment.cigar);
+        if (phase) {
+            if (!extra_tags.empty()) extra_tags += '\t';
+            extra_tags += format_phase_tags(*phase);
+        }
+    }
+
     // Output primary alignment
     sam.add(best_alignment, record, read.rc, mapq, PRIMARY, details, extra_tags);
 
@@ -385,6 +441,10 @@ inline void align_single(
             supp_extra += "YS:Z:" + bp_infos[i].sv_type;
             supp_extra += '\t';
             supp_extra += bp_infos[i].format_all(references);
+        }
+        if (sv_tags && i < supp_tied_counts.size() && supp_tied_counts[i] > 0) {
+            if (!supp_extra.empty()) supp_extra += '\t';
+            supp_extra += "Xt:i:" + std::to_string(supp_tied_counts[i]);
         }
         sam.add(supplementaries[i], record, read.rc, mapq, SUPPLEMENTARY_ALN, details, supp_extra);
     }
@@ -507,6 +567,7 @@ inline Alignment extend_seed(
 
 struct ReadSupplementaryInfo {
     std::vector<Alignment> supps;
+    std::vector<int> tied_counts;  // Per-supp: how many candidates shared the same score
     std::string primary_sa_tag;  // SA tag for the primary record
     std::vector<std::string> supp_sa_tags;  // SA tag for each supplementary record
 };
@@ -602,7 +663,7 @@ ReadSupplementaryInfo build_supplementary_info(
         tries++;
     }
 
-    info.supps = select_supplementary(primary, candidates, max_supplementary, max_supp_overlap);
+    std::tie(info.supps, info.tied_counts) = select_supplementary(primary, candidates, max_supplementary, max_supp_overlap);
     build_sa_tags(info, sam, primary, mapq);
 
     return info;
@@ -632,7 +693,7 @@ ReadSupplementaryInfo build_supplementary_info_from_candidates(
         return info;
     }
 
-    info.supps = select_supplementary(primary, candidates, max_supplementary, max_supp_overlap);
+    std::tie(info.supps, info.tied_counts) = select_supplementary(primary, candidates, max_supplementary, max_supp_overlap);
     build_sa_tags(info, sam, primary, mapq);
 
     return info;
@@ -654,7 +715,8 @@ std::vector<ScoredAlignmentPair> rescue_read(
     std::array<Details, 2>& details,
     int k,
     float mu,
-    float sigma
+    float sigma,
+    float rescue_sigma_mult
 ) {
     Nam n_max1 = nams1[0];
     int tries = 0;
@@ -676,7 +738,7 @@ std::vector<ScoredAlignmentPair> rescue_read(
         details[0].tried_alignment++;
 
         // Force SW alignment to rescue mate
-        Alignment a2 = rescue_align(aligner, nam, references, read2, mu, sigma, k);
+        Alignment a2 = rescue_align(aligner, nam, references, read2, mu, sigma, k, rescue_sigma_mult);
         details[1].mate_rescue += !a2.is_unaligned;
         alignments2.emplace_back(a2);
 
@@ -703,7 +765,8 @@ void output_aligned_pairs(
     float mu,
     float sigma,
     const std::array<Details, 2>& details,
-    bool sv_tags
+    bool sv_tags,
+    const PhasingMap* phasing_map = nullptr
 ) {
 
     if (high_scores.empty()) {
@@ -723,6 +786,16 @@ void output_aligned_pairs(
         if (sv_tags) {
             extra1 = build_sv_tags(alignment1, alignment2, mu, sigma, details[0], false);
             extra2 = build_sv_tags(alignment1, alignment2, mu, sigma, details[1], false);
+        }
+        if (phasing_map) {
+            if (!alignment1.is_unaligned) {
+                auto p1 = phasing_map->assign_haplotype(alignment1, record1.seq, alignment1.cigar);
+                if (p1) { if (!extra1.empty()) extra1 += '\t'; extra1 += format_phase_tags(*p1); }
+            }
+            if (!alignment2.is_unaligned) {
+                auto p2 = phasing_map->assign_haplotype(alignment2, record2.seq, alignment2.cigar);
+                if (p2) { if (!extra2.empty()) extra2 += '\t'; extra2 += format_phase_tags(*p2); }
+            }
         }
         sam.add_pair(alignment1, alignment2, record1, record2, read1.rc, read2.rc, mapq1, mapq2, is_proper_pair(alignment1, alignment2, mu, sigma), PRIMARY, details, extra1, extra2);
     } else {
@@ -745,6 +818,16 @@ void output_aligned_pairs(
                 if (sv_tags && i == 0) {
                     extra1 = build_sv_tags(alignment1, alignment2, mu, sigma, details[0], false);
                     extra2 = build_sv_tags(alignment1, alignment2, mu, sigma, details[1], false);
+                }
+                if (phasing_map && i == 0) {
+                    if (!alignment1.is_unaligned) {
+                        auto p1 = phasing_map->assign_haplotype(alignment1, record1.seq, alignment1.cigar);
+                        if (p1) { if (!extra1.empty()) extra1 += '\t'; extra1 += format_phase_tags(*p1); }
+                    }
+                    if (!alignment2.is_unaligned) {
+                        auto p2 = phasing_map->assign_haplotype(alignment2, record2.seq, alignment2.cigar);
+                        if (p2) { if (!extra2.empty()) extra2 += '\t'; extra2 += format_phase_tags(*p2); }
+                    }
                 }
                 sam.add_pair(alignment1, alignment2, record1, record2, read1.rc, read2.rc, mapq1, mapq2, is_proper, aln_type, details, extra1, extra2);
             } else {
@@ -777,7 +860,8 @@ std::vector<ScoredAlignmentPair> align_paired(
     std::array<Details, 2>& details,
     float dropoff,
     const InsertSizeDistribution &isize_est,
-    unsigned max_tries
+    unsigned max_tries,
+    float rescue_sigma_mult = 5.0f
 ) {
     const auto mu = isize_est.mu;
     const auto sigma = isize_est.sigma;
@@ -800,7 +884,8 @@ std::vector<ScoredAlignmentPair> align_paired(
             details,
             k,
             mu,
-            sigma
+            sigma,
+            rescue_sigma_mult
         );
     }
 
@@ -818,7 +903,8 @@ std::vector<ScoredAlignmentPair> align_paired(
             swapped_details,
             k,
             mu,
-            sigma
+            sigma,
+            rescue_sigma_mult
         );
         details[0] += swapped_details[1];
         details[1] += swapped_details[0];
@@ -910,7 +996,7 @@ std::vector<ScoredAlignmentPair> align_paired(
             }
         } else {
             details[1].inconsistent_nams += !reverse_nam_if_needed(n2, read2, references, k);
-            a1 = rescue_align(aligner, n2, references, read1, mu, sigma, k);
+            a1 = rescue_align(aligner, n2, references, read1, mu, sigma, k, rescue_sigma_mult);
             details[0].mate_rescue += !a1.is_unaligned;
             details[0].tried_alignment++;
         }
@@ -933,7 +1019,7 @@ std::vector<ScoredAlignmentPair> align_paired(
             }
         } else {
             details[0].inconsistent_nams += !reverse_nam_if_needed(n1, read1, references, k);
-            a2 = rescue_align(aligner, n1, references, read2, mu, sigma, k);
+            a2 = rescue_align(aligner, n1, references, read2, mu, sigma, k, rescue_sigma_mult);
             details[1].mate_rescue += !a2.is_unaligned;
             details[1].tried_alignment++;
         }
@@ -1172,7 +1258,8 @@ void align_or_map_paired(
     std::vector<double> &abundances,
     SvEvidenceCollector* collector,
     const HotspotMap* hotspot_map,
-    const MappingParameters* relaxed_params
+    const MappingParameters* relaxed_params,
+    const PhasingMap* phasing_map
 ) {
     std::array<Details, 2> details;
     std::array<std::vector<Nam>, 2> nams_pair;
@@ -1231,7 +1318,8 @@ void align_or_map_paired(
             aligner, nams_pair[0], nams_pair[1], read1, read2,
             index_parameters.syncmer.k, references, details,
             effective_params.dropoff_threshold, isize_est,
-            effective_params.max_tries
+            effective_params.max_tries,
+            effective_params.rescue_sigma_mult
         );
 
         // -1 marks the typical case that both reads map uniquely and form a
@@ -1382,6 +1470,17 @@ void align_or_map_paired(
                     extra2 += "XH:i:1";
                 }
 
+                if (phasing_map) {
+                    if (!alignment1.is_unaligned) {
+                        auto p1 = phasing_map->assign_haplotype(alignment1, record1.seq, alignment1.cigar);
+                        if (p1) { if (!extra1.empty()) extra1 += '\t'; extra1 += format_phase_tags(*p1); }
+                    }
+                    if (!alignment2.is_unaligned) {
+                        auto p2 = phasing_map->assign_haplotype(alignment2, record2.seq, alignment2.cigar);
+                        if (p2) { if (!extra2.empty()) extra2 += '\t'; extra2 += format_phase_tags(*p2); }
+                    }
+                }
+
                 sam.add_pair(alignment1, alignment2, record1, record2, read1.rc, read2.rc, mapq1, mapq2, is_proper, PRIMARY, details, extra1, extra2);
 
                 for (size_t j = 0; j < si1.supps.size(); ++j) {
@@ -1392,6 +1491,10 @@ void align_or_map_paired(
                         if (j < bp_infos1.size()) {
                             supp_extra += '\t';
                             supp_extra += bp_infos1[j].format_all(references);
+                        }
+                        if (j < si1.tied_counts.size() && si1.tied_counts[j] > 0) {
+                            supp_extra += '\t';
+                            supp_extra += "Xt:i:" + std::to_string(si1.tied_counts[j]);
                         }
                     }
                     sam.add_paired_supplementary(si1.supps[j], record1, read1.rc, mapq1, true, alignment2, mapq2, details[0], supp_extra);
@@ -1405,10 +1508,24 @@ void align_or_map_paired(
                             supp_extra += '\t';
                             supp_extra += bp_infos2[j].format_all(references);
                         }
+                        if (j < si2.tied_counts.size() && si2.tied_counts[j] > 0) {
+                            supp_extra += '\t';
+                            supp_extra += "Xt:i:" + std::to_string(si2.tied_counts[j]);
+                        }
                     }
                     sam.add_paired_supplementary(si2.supps[j], record2, read2.rc, mapq2, false, alignment1, mapq1, details[1], supp_extra);
                 }
             } else {
+                if (phasing_map) {
+                    if (!alignment1.is_unaligned) {
+                        auto p1 = phasing_map->assign_haplotype(alignment1, record1.seq, alignment1.cigar);
+                        if (p1) { if (!sv_extra1.empty()) sv_extra1 += '\t'; sv_extra1 += format_phase_tags(*p1); }
+                    }
+                    if (!alignment2.is_unaligned) {
+                        auto p2 = phasing_map->assign_haplotype(alignment2, record2.seq, alignment2.cigar);
+                        if (p2) { if (!sv_extra2.empty()) sv_extra2 += '\t'; sv_extra2 += format_phase_tags(*p2); }
+                    }
+                }
                 sam.add_pair(alignment1, alignment2, record1, record2, read1.rc, read2.rc, mapq1, mapq2, is_proper, PRIMARY, details, sv_extra1, sv_extra2);
             }
         } else {
@@ -1589,6 +1706,18 @@ void align_or_map_paired(
                     extra2 += "XH:i:1";
                 }
 
+                // HP/PS: haplotype phasing
+                if (phasing_map) {
+                    if (!primary1.is_unaligned) {
+                        auto p1 = phasing_map->assign_haplotype(primary1, record1.seq, primary1.cigar);
+                        if (p1) { if (!extra1.empty()) extra1 += '\t'; extra1 += format_phase_tags(*p1); }
+                    }
+                    if (!primary2.is_unaligned) {
+                        auto p2 = phasing_map->assign_haplotype(primary2, record2.seq, primary2.cigar);
+                        if (p2) { if (!extra2.empty()) extra2 += '\t'; extra2 += format_phase_tags(*p2); }
+                    }
+                }
+
                 // Output primary pair with SA + SV tags
                 sam.add_pair(primary1, primary2, record1, record2, read1.rc, read2.rc, mapq1, mapq2, is_proper, PRIMARY, details, extra1, extra2);
 
@@ -1602,6 +1731,10 @@ void align_or_map_paired(
                             supp_extra += '\t';
                             supp_extra += bp_infos1[j].format_all(references);
                         }
+                        if (j < si1.tied_counts.size() && si1.tied_counts[j] > 0) {
+                            supp_extra += '\t';
+                            supp_extra += "Xt:i:" + std::to_string(si1.tied_counts[j]);
+                        }
                     }
                     sam.add_paired_supplementary(si1.supps[j], record1, read1.rc, mapq1, true, primary2, mapq2, details[0], supp_extra);
                 }
@@ -1613,6 +1746,10 @@ void align_or_map_paired(
                         if (j < bp_infos2.size()) {
                             supp_extra += '\t';
                             supp_extra += bp_infos2[j].format_all(references);
+                        }
+                        if (j < si2.tied_counts.size() && si2.tied_counts[j] > 0) {
+                            supp_extra += '\t';
+                            supp_extra += "Xt:i:" + std::to_string(si2.tied_counts[j]);
                         }
                     }
                     sam.add_paired_supplementary(si2.supps[j], record2, read2.rc, mapq2, false, primary1, mapq1, details[1], supp_extra);
@@ -1642,7 +1779,8 @@ void align_or_map_paired(
                     isize_est.mu,
                     isize_est.sigma,
                     details,
-                    map_param.sv_tags
+                    map_param.sv_tags,
+                    phasing_map
                 );
             }
         }
@@ -1667,7 +1805,8 @@ void align_or_map_single(
     std::vector<double> &abundances,
     SvEvidenceCollector* collector,
     const HotspotMap* hotspot_map,
-    const MappingParameters* relaxed_params
+    const MappingParameters* relaxed_params,
+    const PhasingMap* phasing_map
 ) {
     Details details;
     std::vector<Nam> nams;
@@ -1723,7 +1862,7 @@ void align_or_map_single(
                 references, details, se_params.dropoff_threshold, se_params.max_tries,
                 se_params.max_secondary, se_params.max_supplementary,
                 se_params.max_supp_overlap, random_engine, se_params.sv_tags,
-                collector, se_near_hotspot
+                collector, se_near_hotspot, phasing_map, se_params.min_clip
             );
             break;
         }

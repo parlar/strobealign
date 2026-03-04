@@ -8,9 +8,9 @@
 std::string BreakpointInfo::format_all(const References& refs) const {
     std::string result;
     // YB: breakpoint intervals
-    int left_lo = left_bp - mh_bwd;
+    int left_lo = std::max(0, left_bp - mh_bwd);
     int left_hi = left_bp + mh_fwd;
-    int right_lo = right_bp - mh_bwd;
+    int right_lo = std::max(0, right_bp - mh_bwd);
     int right_hi = right_bp + mh_fwd;
     result += "YB:Z:";
     result += refs.names[left_ref_id];
@@ -86,8 +86,8 @@ std::string compute_yd_tag(
     if (a1.is_unaligned || a2.is_unaligned) return "";
     if (a1.ref_id != a2.ref_id) return "";
     if (sigma <= 0) return "";
-    int insert = std::abs(a2.ref_start - a1.ref_start);
-    float zscore = std::abs(insert - mu) / sigma;
+    float insert = std::abs(a2.ref_start - a1.ref_start);
+    float zscore = std::fabs(insert - mu) / sigma;
     char buf[32];
     std::snprintf(buf, sizeof(buf), "YD:f:%.2f", zscore);
     return buf;
@@ -220,13 +220,18 @@ int compute_ci_width(
     int total_bases = end - start;
     if (total_bases <= 0) return microhomology_total;
 
+    // Mark repeat positions to avoid double-counting between homopolymer and
+    // dinucleotide repeat detectors
+    std::vector<bool> is_repeat(total_bases, false);
+
     // Detect homopolymer runs (>=3bp)
-    int repeat_bases = 0;
     for (int i = start; i < end; ) {
         char c = std::toupper(seq[i]);
         int run = 1;
         while (i + run < end && std::toupper(seq[i + run]) == c) run++;
-        if (run >= 3) repeat_bases += run;
+        if (run >= 3) {
+            for (int j = 0; j < run; ++j) is_repeat[i - start + j] = true;
+        }
         i += run;
     }
 
@@ -241,12 +246,14 @@ int compute_ci_width(
                std::toupper(seq[i + run + 1]) == c2) {
             run += 2;
         }
-        if (run >= 6) repeat_bases += run;
+        if (run >= 6) {
+            for (int j = 0; j < run; ++j) is_repeat[i - start + j] = true;
+        }
         i += std::max(run, 1);
     }
 
-    // Cap repeat_bases at total_bases to avoid fraction > 1
-    repeat_bases = std::min(repeat_bases, total_bases);
+    int repeat_bases = 0;
+    for (bool r : is_repeat) repeat_bases += r;
     float repeat_frac = static_cast<float>(repeat_bases) / total_bases;
     int repeat_bonus = std::lround(repeat_frac * 10.0f);
     return microhomology_total + repeat_bonus;
@@ -383,4 +390,62 @@ std::string build_sv_tags(
     if (!tags.empty()) tags += '\t';
     tags += xr;
     return tags;
+}
+
+/*
+ * Compute XU posteriors: probability of REF / SV / RPT classification.
+ *
+ * Inputs (all from existing SV tags on the SE primary record):
+ *   score_ratio  - XR: best_supp_score / primary_score (0-1, higher = supp is strong)
+ *   artifact_prob - XF: max artifact probability (0-1, higher = likely artifact)
+ *   entropy       - XE: split chain entropy (0+, higher = more ambiguous)
+ *   mappability   - XW: local mappability (0-1, lower = more repetitive)
+ *   tied_count    - Xt: number of tied supplementary candidates (0+)
+ *
+ * Uses log-odds + softmax to produce normalized posteriors.
+ */
+XuPosteriors compute_xu_posteriors(
+    float score_ratio,
+    float artifact_prob,
+    float entropy,
+    float mappability,
+    int tied_count
+) {
+    // Clamp inputs to valid ranges
+    score_ratio = std::max(0.0f, std::min(1.0f, score_ratio));
+    artifact_prob = std::max(0.0f, std::min(1.0f, artifact_prob));
+    entropy = std::max(0.0f, entropy);
+    mappability = std::max(0.0f, std::min(1.0f, mappability));
+
+    // Log-odds for each class (higher = more likely)
+    // SV: strong supplementary, low artifact, low entropy, good mappability
+    float lo_sv = 2.0f * score_ratio
+                - 3.0f * artifact_prob
+                - 1.0f * std::min(entropy, 3.0f)
+                + 1.0f * mappability;
+
+    // RPT: low mappability, high entropy, many tied candidates
+    float lo_rpt = -2.0f * mappability
+                 + 1.5f * std::min(entropy, 3.0f)
+                 + 0.5f * std::min(static_cast<float>(tied_count), 10.0f);
+
+    // REF: high artifact probability, weak supplementary
+    float lo_ref = 2.0f * artifact_prob
+                 - 2.0f * score_ratio
+                 + 0.5f * std::min(entropy, 3.0f);
+
+    // Softmax
+    float max_lo = std::max({lo_sv, lo_rpt, lo_ref});
+    float e_sv  = std::exp(lo_sv - max_lo);
+    float e_rpt = std::exp(lo_rpt - max_lo);
+    float e_ref = std::exp(lo_ref - max_lo);
+    float total = e_sv + e_rpt + e_ref;
+
+    return XuPosteriors{e_ref / total, e_sv / total, e_rpt / total};
+}
+
+std::string format_xu_tag(const XuPosteriors& xu) {
+    char buf[64];
+    std::snprintf(buf, sizeof(buf), "XU:Z:REF:%.2f,SV:%.2f,RPT:%.2f", xu.ref, xu.sv, xu.rpt);
+    return buf;
 }

@@ -15,6 +15,7 @@
 #include "mappingparameters.hpp"
 #include "aligner.hpp"
 #include "svhotspot.hpp"
+#include "phasing.hpp"
 
 class InputBuffer {
 
@@ -78,7 +79,8 @@ void perform_task(InputBuffer &input_buffer, OutputBuffer &output_buffer,
                   const References& references, const StrobemerIndex& index, const std::string& read_group_id, std::vector<double> &abundances,
                   SvEvidenceCollector* collector = nullptr,
                   const HotspotMap* hotspot_map = nullptr,
-                  const MappingParameters* relaxed_params = nullptr);
+                  const MappingParameters* relaxed_params = nullptr,
+                  const PhasingMap* phasing_map = nullptr);
 
 bool same_name(const std::string& n1, const std::string& n2);
 

@@ -147,7 +147,8 @@ void perform_task(
     std::vector<double> &abundances,
     SvEvidenceCollector* collector,
     const HotspotMap* hotspot_map,
-    const MappingParameters* relaxed_params
+    const MappingParameters* relaxed_params,
+    const PhasingMap* phasing_map
 ) {
     Aligner aligner{aln_params};
     Chainer chainer{map_param.chaining_params, index.k()};
@@ -180,13 +181,13 @@ void perform_task(
             to_uppercase(record2.seq);
             align_or_map_paired(record1, record2, sam, sam_out, statistics, isize_est, aligner,
                         chainer, map_param, index_parameters, references, index, random_engine, abundances,
-                        collector, hotspot_map, relaxed_params);
+                        collector, hotspot_map, relaxed_params, phasing_map);
             statistics.n_reads += 2;
         }
         for (size_t i = 0; i < records3.size(); ++i) {
             auto record = records3[i];
             align_or_map_single(record, sam, sam_out, statistics, aligner, chainer, map_param, index_parameters, references, index, random_engine, abundances,
-                        collector, hotspot_map, relaxed_params);
+                        collector, hotspot_map, relaxed_params, phasing_map);
             statistics.n_reads++;
         }
 

@@ -16,6 +16,7 @@
 #include "nam.hpp"
 #include "mappingparameters.hpp"
 #include "svhotspot.hpp"
+#include "phasing.hpp"
 
 void align_or_map_paired(
     const klibpp::KSeq& record1,
@@ -34,7 +35,8 @@ void align_or_map_paired(
     std::vector<double> &abundances,
     SvEvidenceCollector* collector = nullptr,
     const HotspotMap* hotspot_map = nullptr,
-    const MappingParameters* relaxed_params = nullptr
+    const MappingParameters* relaxed_params = nullptr,
+    const PhasingMap* phasing_map = nullptr
 );
 
 void align_or_map_single(
@@ -52,7 +54,8 @@ void align_or_map_single(
     std::vector<double> &abundances,
     SvEvidenceCollector* collector = nullptr,
     const HotspotMap* hotspot_map = nullptr,
-    const MappingParameters* relaxed_params = nullptr
+    const MappingParameters* relaxed_params = nullptr,
+    const PhasingMap* phasing_map = nullptr
 );
 
 // Private declarations, only needed for tests

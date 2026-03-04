@@ -204,7 +204,8 @@ Alignment rescue_align(
     const Read& read,
     float mu,
     float sigma,
-    int k
+    int k,
+    float sigma_mult
 ) {
     Alignment alignment;
     int a, b;
@@ -213,12 +214,12 @@ Alignment rescue_align(
 
     if (mate_nam.is_revcomp) {
         r_tmp = read.seq;
-        a = mate_nam.projected_ref_start() - (mu+5*sigma);
+        a = mate_nam.projected_ref_start() - (mu+sigma_mult*sigma);
         b = mate_nam.projected_ref_start() + read_len/2; // at most half read overlap
     } else {
         r_tmp = read.rc; // mate is rc since fr orientation
         a = mate_nam.ref_end + (read_len - mate_nam.query_end) - read_len/2; // at most half read overlap
-        b = mate_nam.ref_end + (read_len - mate_nam.query_end) + (mu+5*sigma);
+        b = mate_nam.ref_end + (read_len - mate_nam.query_end) + (mu+sigma_mult*sigma);
     }
 
     auto ref_len = static_cast<int>(references.lengths[mate_nam.ref_id]);

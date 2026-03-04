@@ -20,6 +20,7 @@
 #include "index.hpp"
 #include "pc.hpp"
 #include "svhotspot.hpp"
+#include "phasing.hpp"
 #include "logger.hpp"
 #include "timer.hpp"
 #include "readlen.hpp"
@@ -209,6 +210,9 @@ int run_strobealign(int argc, char **argv) {
     map_param.details = opt.details;
     map_param.fastq_comments = opt.fastq_comments;
     map_param.sv_tags = opt.sv_tags;
+    if (opt.sv_tags) {
+        map_param.rescue_sigma_mult = 10.0f;
+    }
     map_param.use_nams = opt.nams;
     map_param.chaining_params.max_lookback = opt.max_lookback;
     map_param.chaining_params.diag_diff_penalty = opt.diag_diff_penalty;
@@ -353,6 +357,16 @@ int run_strobealign(int argc, char **argv) {
 
     OutputBuffer output_buffer(out);
 
+    // Haplotype phasing support
+    PhasingMap phasing_map;
+    if (!opt.phase_vcf.empty()) {
+        Timer phase_timer;
+        phasing_map.load(opt.phase_vcf, references);
+        logger.info() << "Loaded " << phasing_map.total_variants()
+                      << " phased variants in " << phase_timer.elapsed() << " s\n";
+    }
+    const PhasingMap* phasing_ptr = phasing_map.empty() ? nullptr : &phasing_map;
+
     // Two-pass SV-hotspot realignment support
     HotspotMap hotspot_map;
     MappingParameters relaxed_map_param;
@@ -372,7 +386,7 @@ int run_strobealign(int argc, char **argv) {
                 std::ref(worker_statistics[i]), std::ref(worker_done[i]), std::ref(aln_params),
                 std::ref(map_param), std::ref(index_parameters), std::ref(references),
                 std::ref(index), std::ref(opt.read_group_id), std::ref(worker_abundances[i]),
-                &collectors[i], nullptr, nullptr);
+                &collectors[i], nullptr, nullptr, phasing_ptr);
             workers.push_back(std::move(consumer));
         }
         if (opt.show_progress && isatty(2)) {
@@ -419,7 +433,7 @@ int run_strobealign(int argc, char **argv) {
                 std::ref(worker_statistics[i]), std::ref(worker_done2[i]), std::ref(aln_params),
                 std::ref(map_param), std::ref(index_parameters), std::ref(references),
                 std::ref(index), std::ref(opt.read_group_id), std::ref(worker_abundances[i]),
-                nullptr, &hotspot_map, &relaxed_map_param);
+                nullptr, &hotspot_map, &relaxed_map_param, phasing_ptr);
             workers.push_back(std::move(consumer));
         }
         if (opt.show_progress && isatty(2)) {
@@ -439,7 +453,7 @@ int run_strobealign(int argc, char **argv) {
                 std::ref(worker_statistics[i]), std::ref(worker_done[i]), std::ref(aln_params),
                 std::ref(map_param), std::ref(index_parameters), std::ref(references),
                 std::ref(index), std::ref(opt.read_group_id), std::ref(worker_abundances[i]),
-                nullptr, nullptr, nullptr);
+                nullptr, nullptr, nullptr, phasing_ptr);
             workers.push_back(std::move(consumer));
         }
         if (opt.show_progress && isatty(2)) {

@@ -54,7 +54,8 @@ Alignment rescue_align(
     const Read& read,
     float mu,
     float sigma,
-    int k);
+    int k,
+    float sigma_mult = 5.0f);
 
 void deduplicate_scored_pairs(std::vector<ScoredAlignmentPair>& pairs);
 
