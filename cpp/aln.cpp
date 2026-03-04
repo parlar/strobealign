@@ -400,8 +400,52 @@ struct ReadSupplementaryInfo {
 };
 
 /*
+ * Build SA tags linking primary and supplementary records.
+ * Populates primary_sa_tag and supp_sa_tags in info.
+ */
+void build_sa_tags(
+    ReadSupplementaryInfo& info,
+    Sam& sam,
+    const Alignment& primary,
+    uint8_t mapq
+) {
+    if (info.supps.empty()) return;
+
+    std::string primary_entry = sam.format_sa_entry(primary, mapq);
+    std::vector<std::string> supp_entries;
+    for (auto& s : info.supps) {
+        supp_entries.push_back(sam.format_sa_entry(s, mapq));
+    }
+
+    info.primary_sa_tag = "SA:Z:";
+    for (auto& e : supp_entries) {
+        info.primary_sa_tag.append(e);
+    }
+
+    for (size_t i = 0; i < info.supps.size(); ++i) {
+        std::string tag = "SA:Z:";
+        tag.append(primary_entry);
+        for (size_t j = 0; j < info.supps.size(); ++j) {
+            if (j != i) tag.append(supp_entries[j]);
+        }
+        info.supp_sa_tags.push_back(tag);
+    }
+}
+
+/*
+ * Check if primary alignment has enough soft clipping to warrant
+ * searching for supplementary alignments.
+ */
+bool has_significant_soft_clip(const Alignment& primary, int read_len, int k) {
+    int left_clip = primary.query_start;
+    int right_clip = read_len - primary.query_end;
+    return left_clip >= k || right_clip >= k;
+}
+
+/*
  * Detect supplementary alignments for one read by aligning its NAMs,
  * then build SA tags linking primary and supplementary records.
+ * Used on the fast path where only the primary has been aligned.
  */
 ReadSupplementaryInfo build_supplementary_info(
     Sam& sam,
@@ -419,6 +463,12 @@ ReadSupplementaryInfo build_supplementary_info(
 ) {
     ReadSupplementaryInfo info;
     if (max_supplementary == 0 || nams.empty() || primary.is_unaligned) {
+        return info;
+    }
+
+    // Early exit: if primary covers most of the read (both soft clips < k),
+    // there's no room for a meaningful supplementary alignment
+    if (!has_significant_soft_clip(primary, read.size(), k)) {
         return info;
     }
 
@@ -440,28 +490,37 @@ ReadSupplementaryInfo build_supplementary_info(
     }
 
     info.supps = select_supplementary(primary, candidates, max_supplementary, max_supp_overlap);
-    if (info.supps.empty()) return info;
+    build_sa_tags(info, sam, primary, mapq);
 
-    // Build SA tags
-    std::string primary_entry = sam.format_sa_entry(primary, mapq);
-    std::vector<std::string> supp_entries;
-    for (auto& s : info.supps) {
-        supp_entries.push_back(sam.format_sa_entry(s, mapq));
+    return info;
+}
+
+/*
+ * Build supplementary info from pre-computed candidate alignments.
+ * Used on the normal paired-end path where alignments are already available.
+ */
+ReadSupplementaryInfo build_supplementary_info_from_candidates(
+    Sam& sam,
+    const std::vector<Alignment>& candidates,
+    const Alignment& primary,
+    uint8_t mapq,
+    unsigned max_supplementary,
+    int max_supp_overlap,
+    int read_len,
+    int k
+) {
+    ReadSupplementaryInfo info;
+    if (max_supplementary == 0 || primary.is_unaligned || candidates.empty()) {
+        return info;
     }
 
-    info.primary_sa_tag = "SA:Z:";
-    for (auto& e : supp_entries) {
-        info.primary_sa_tag.append(e);
+    // Early exit: if primary covers most of the read, skip
+    if (!has_significant_soft_clip(primary, read_len, k)) {
+        return info;
     }
 
-    for (size_t i = 0; i < info.supps.size(); ++i) {
-        std::string tag = "SA:Z:";
-        tag.append(primary_entry);
-        for (size_t j = 0; j < info.supps.size(); ++j) {
-            if (j != i) tag.append(supp_entries[j]);
-        }
-        info.supp_sa_tags.push_back(tag);
-    }
+    info.supps = select_supplementary(primary, candidates, max_supplementary, max_supp_overlap);
+    build_sa_tags(info, sam, primary, mapq);
 
     return info;
 }
@@ -1393,8 +1452,31 @@ void align_or_map_paired(
                 bool is_proper = is_proper_pair(primary1, primary2, isize_est.mu, isize_est.sigma);
 
                 auto k = index_parameters.syncmer.k;
-                auto si1 = build_supplementary_info(sam, aligner, nams_pair[0], read1, primary1, mapq1, k, references, map_param.dropoff_threshold, map_param.max_tries, map_param.max_supplementary, map_param.max_supp_overlap);
-                auto si2 = build_supplementary_info(sam, aligner, nams_pair[1], read2, primary2, mapq2, k, references, map_param.dropoff_threshold, map_param.max_tries, map_param.max_supplementary, map_param.max_supp_overlap);
+
+                // Extract unique per-read alignments from scored pairs
+                // (these were already computed by align_paired, no need to re-align)
+                std::vector<Alignment> candidates1, candidates2;
+                for (const auto& ap : alignment_pairs) {
+                    const auto& a1 = ap.alignment1;
+                    if (!a1.is_unaligned) {
+                        bool found = false;
+                        for (const auto& c : candidates1) {
+                            if (c.ref_id == a1.ref_id && c.ref_start == a1.ref_start) { found = true; break; }
+                        }
+                        if (!found) candidates1.push_back(a1);
+                    }
+                    const auto& a2 = ap.alignment2;
+                    if (!a2.is_unaligned) {
+                        bool found = false;
+                        for (const auto& c : candidates2) {
+                            if (c.ref_id == a2.ref_id && c.ref_start == a2.ref_start) { found = true; break; }
+                        }
+                        if (!found) candidates2.push_back(a2);
+                    }
+                }
+
+                auto si1 = build_supplementary_info_from_candidates(sam, candidates1, primary1, mapq1, map_param.max_supplementary, map_param.max_supp_overlap, record1.seq.length(), k);
+                auto si2 = build_supplementary_info_from_candidates(sam, candidates2, primary2, mapq2, map_param.max_supplementary, map_param.max_supp_overlap, record2.seq.length(), k);
 
                 // Output primary pair with SA tags
                 sam.add_pair(primary1, primary2, record1, record2, read1.rc, read2.rc, mapq1, mapq2, is_proper, PRIMARY, details, si1.primary_sa_tag, si2.primary_sa_tag);
