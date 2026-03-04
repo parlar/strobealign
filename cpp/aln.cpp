@@ -503,7 +503,7 @@ inline Alignment extend_seed(
     int result_ref_start;
     bool gapped = true;
     if (projected_ref_end - projected_ref_start == query.size() && consistent_nam) {
-        std::string ref_segm_ham = ref.substr(projected_ref_start, query.size());
+        std::string_view ref_segm_ham(ref.data() + projected_ref_start, query.size());
         auto hamming_dist = hamming_distance(query, ref_segm_ham);
 
         if (hamming_dist >= 0 && (((float) hamming_dist / query.size()) < 0.05) ) { //Hamming distance worked fine, no need to ksw align
@@ -518,7 +518,7 @@ inline Alignment extend_seed(
         const int ref_start = projected_ref_start - ext_left;
         const int ext_right = std::min(std::size_t(50), ref.size() - nam.ref_end);
         const auto ref_segm_size = read.size() + diff + ext_left + ext_right;
-        const auto ref_segm = ref.substr(ref_start, ref_segm_size);
+        std::string_view ref_segm(ref.data() + ref_start, ref_segm_size);
         auto opt_info = aligner.align(query, ref_segm);
         if (opt_info) {
             info = opt_info.value();
@@ -1173,15 +1173,72 @@ void shuffle_top_nams(std::vector<Nam>& nams, std::minstd_rand& random_engine) {
 
 /*
  * Determine (roughly) whether the read sequence has some l-mer (with l = k*2/3)
- * in common with the reference sequence
+ * in common with the reference sequence.
+ *
+ * Uses Rabin-Karp rolling hash: build a hash set of ref l-mers in O(ref_len),
+ * then check read l-mers in O(read_len) with O(1) lookups.
  */
-bool has_shared_substring(const std::string& read_seq, const std::string& ref_seq, int k) {
-    size_t sub_size = 2 * k / 3;
-    size_t step_size = k / 3;
-    std::string_view ref_view(ref_seq);
-    std::string_view read_view(read_seq);
-    for (size_t i = 0; i + sub_size <= read_view.size(); i += step_size) {
-        if (ref_view.find(read_view.substr(i, sub_size)) != std::string_view::npos) {
+bool has_shared_substring(std::string_view read_seq, std::string_view ref_seq, int k) {
+    const size_t sub_size = 2 * k / 3;
+    const size_t step_size = k / 3;
+    if (sub_size == 0 || ref_seq.size() < sub_size || read_seq.size() < sub_size) {
+        return false;
+    }
+
+    // NTHash-style rolling hash using XOR of per-position hashes.
+    // Each character gets a random 64-bit value rotated by its position.
+    static constexpr uint64_t char_hash[4] = {
+        0x3c8bfbb395c60474ULL,  // A
+        0x3193c18562a02b4cULL,  // C
+        0x20323ed082572324ULL,  // G
+        0x295549f54be24456ULL,  // T
+    };
+
+    auto encode = [](char c) -> unsigned {
+        // A=0, C=1, G=2, T=3; anything else maps to 0
+        return ((c >> 1) & 3);
+    };
+
+    auto rot_left = [](uint64_t v, unsigned r) -> uint64_t {
+        r &= 63;
+        return (v << r) | (v >> (64 - r));
+    };
+
+    // Build hash set of all l-mers in ref
+    // Compute initial hash for ref[0..sub_size)
+    uint64_t ref_hash = 0;
+    for (size_t j = 0; j < sub_size; j++) {
+        ref_hash ^= rot_left(char_hash[encode(ref_seq[j])], sub_size - 1 - j);
+    }
+
+    robin_hood::unordered_flat_set<uint64_t> ref_hashes;
+    ref_hashes.reserve(ref_seq.size() - sub_size + 1);
+    ref_hashes.insert(ref_hash);
+
+    for (size_t j = 1; j + sub_size <= ref_seq.size(); j++) {
+        // Roll: remove leftmost char, add new rightmost char
+        ref_hash = rot_left(ref_hash, 1)
+                 ^ rot_left(char_hash[encode(ref_seq[j - 1])], sub_size)
+                 ^ char_hash[encode(ref_seq[j + sub_size - 1])];
+        ref_hashes.insert(ref_hash);
+    }
+
+    // Check read l-mers against the set, stepping by step_size
+    // Compute initial hash for read[0..sub_size)
+    uint64_t read_hash = 0;
+    for (size_t j = 0; j < sub_size; j++) {
+        read_hash ^= rot_left(char_hash[encode(read_seq[j])], sub_size - 1 - j);
+    }
+    if (ref_hashes.count(read_hash)) {
+        return true;
+    }
+
+    // Roll through all positions, but only check at step_size intervals
+    for (size_t i = 1; i + sub_size <= read_seq.size(); i++) {
+        read_hash = rot_left(read_hash, 1)
+                  ^ rot_left(char_hash[encode(read_seq[i - 1])], sub_size)
+                  ^ char_hash[encode(read_seq[i + sub_size - 1])];
+        if (i % step_size == 0 && ref_hashes.count(read_hash)) {
             return true;
         }
     }

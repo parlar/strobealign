@@ -240,7 +240,8 @@ Alignment rescue_align(
         alignment.is_unaligned = true;
         return alignment;
     }
-    std::string ref_segm = references.sequences[mate_nam.ref_id].substr(ref_start, ref_end - ref_start);
+    const auto& ref_full = references.sequences[mate_nam.ref_id];
+    std::string_view ref_segm(ref_full.data() + ref_start, ref_end - ref_start);
 
     if (!has_shared_substring(r_tmp, ref_segm, k)) {
         alignment.cigar = Cigar();

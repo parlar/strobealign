@@ -2,6 +2,7 @@
 #define STROBEALIGN_ALIGNER_HPP
 
 #include <string>
+#include <string_view>
 #include <tuple>
 #include <optional>
 #include "ssw/ssw_cpp.h"
@@ -38,7 +39,7 @@ public:
         , ssw_aligner(StripedSmithWaterman::Aligner(parameters.match, parameters.mismatch, parameters.gap_open, parameters.gap_extend))
     { }
 
-    std::optional<AlignmentInfo> align(const std::string &query, const std::string &ref) const;
+    std::optional<AlignmentInfo> align(const std::string &query, std::string_view ref) const;
 
     AlignmentParameters parameters;
 
@@ -52,7 +53,7 @@ private:
     mutable unsigned m_align_calls{0};  // no. of calls to the align() method
 };
 
-inline int hamming_distance(const std::string &s, const std::string &t) {
+inline int hamming_distance(std::string_view s, std::string_view t) {
     if (s.length() != t.length()){
         return -1;
     }
@@ -68,11 +69,11 @@ inline int hamming_distance(const std::string &s, const std::string &t) {
 }
 
 std::tuple<size_t, size_t, int> highest_scoring_segment(
-    const std::string& query, const std::string& ref, int match, int mismatch, int end_bonus
+    std::string_view query, std::string_view ref, int match, int mismatch, int end_bonus
 );
 
 AlignmentInfo hamming_align(
-    const std::string &query, const std::string &ref, int match, int mismatch, int end_bonus
+    std::string_view query, std::string_view ref, int match, int mismatch, int end_bonus
 );
 
 #endif

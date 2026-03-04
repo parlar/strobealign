@@ -10,7 +10,7 @@
 #include <ostream>
 #include "aligner.hpp"
 
-std::optional<AlignmentInfo> Aligner::align(const std::string &query, const std::string &ref) const {
+std::optional<AlignmentInfo> Aligner::align(const std::string &query, std::string_view ref) const {
     m_align_calls++;
     AlignmentInfo aln;
     int32_t maskLen = query.length() / 2;
@@ -22,8 +22,8 @@ std::optional<AlignmentInfo> Aligner::align(const std::string &query, const std:
 
     StripedSmithWaterman::Alignment alignment_ssw;
 
-    // query must be NULL-terminated
-    auto flag = ssw_aligner.Align(query.c_str(), ref.c_str(), ref.size(), filter, &alignment_ssw, maskLen);
+    // query must be NULL-terminated; ref does not need to be (SSW takes pointer + length)
+    auto flag = ssw_aligner.Align(query.c_str(), ref.data(), ref.size(), filter, &alignment_ssw, maskLen);
     if (flag != 0 || alignment_ssw.ref_begin == -1) {
         return {};
     }
@@ -110,7 +110,7 @@ std::optional<AlignmentInfo> Aligner::align(const std::string &query, const std:
  * of the query, once for each end.
  */
 std::tuple<size_t, size_t, int> highest_scoring_segment(
-    const std::string& query, const std::string& ref, int match, int mismatch, int end_bonus
+    std::string_view query, std::string_view ref, int match, int mismatch, int end_bonus
 ) {
     size_t n = query.length();
 
@@ -145,7 +145,7 @@ std::tuple<size_t, size_t, int> highest_scoring_segment(
 }
 
 AlignmentInfo hamming_align(
-    const std::string &query, const std::string &ref, int match, int mismatch, int end_bonus
+    std::string_view query, std::string_view ref, int match, int mismatch, int end_bonus
 ) {
     AlignmentInfo aln;
     if (query.length() != ref.length()) {
