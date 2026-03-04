@@ -159,6 +159,20 @@ std::string compute_ys_tag(const Alignment& supp, const Alignment& primary) {
 }
 
 /*
+ * Compute XD (score delta) and XR (score ratio) between primary and best supplementary.
+ * Supplementaries are already sorted by score descending from select_supplementary().
+ */
+std::string compute_supp_delta_tags(const Alignment& primary, const std::vector<Alignment>& supplementaries) {
+    if (supplementaries.empty() || primary.score <= 0) return "";
+    int best_supp_score = supplementaries[0].score;
+    int delta = primary.score - best_supp_score;
+    float ratio = static_cast<float>(best_supp_score) / primary.score;
+    char buf[64];
+    std::snprintf(buf, sizeof(buf), "XD:i:%d\tXR:f:%.3f", delta, ratio);
+    return buf;
+}
+
+/*
  * Build SV extra_tags string for a paired-end read.
  * Combines YT + YD + Xr tags, tab-separated.
  */
@@ -200,6 +214,22 @@ struct ScoredAlignmentPair {
     Alignment alignment1;
     Alignment alignment2;
 };
+
+/*
+ * Compute Boltzmann-weighted posterior probability for the best pair.
+ * P(best) = exp(score_best / T) / sum_i(exp(score_i / T)), T = 10.
+ */
+float compute_pair_posterior(const std::vector<ScoredAlignmentPair>& pairs) {
+    if (pairs.empty()) return 0.0f;
+    if (pairs.size() == 1) return 1.0f;
+    constexpr double T = 10.0;
+    double best_score = pairs[0].score;
+    double sum = 0.0;
+    for (const auto& p : pairs) {
+        sum += std::exp((p.score - best_score) / T);
+    }
+    return static_cast<float>(1.0 / sum);
+}
 
 inline Alignment extend_seed(
     const Aligner& aligner,
@@ -267,7 +297,8 @@ inline void align_single(
     unsigned max_secondary,
     unsigned max_supplementary,
     int max_supp_overlap,
-    std::minstd_rand& random_engine
+    std::minstd_rand& random_engine,
+    bool sv_tags = false
 ) {
     if (nams.empty()) {
         sam.add_unmapped(record);
@@ -383,8 +414,56 @@ inline void align_single(
         }
     }
 
-    // Output primary alignment (with SA tag if supplementaries exist)
-    sam.add(best_alignment, record, read.rc, mapq, PRIMARY, details, primary_sa_tag);
+    // Set XS (best non-primary alignment score) from extension scores
+    details.xs = second_best_score;
+
+    // Build extra_tags for primary: SA + XD/XR + XA
+    std::string extra_tags = primary_sa_tag;
+
+    // XD/XR: score delta/ratio vs best supplementary (--sv-tags only)
+    if (sv_tags && !supplementaries.empty()) {
+        auto dt = compute_supp_delta_tags(best_alignment, supplementaries);
+        if (!dt.empty()) {
+            if (!extra_tags.empty()) extra_tags += '\t';
+            extra_tags += dt;
+        }
+    }
+
+    // XA: alternative alignment locations (all non-primary, non-supplementary, deduplicated)
+    if (collect_alignments && alignments.size() > 1) {
+        std::string xa_entries;
+        // Track seen (ref_id, ref_start, strand) to avoid duplicates
+        std::vector<std::tuple<int, int, bool>> seen_xa;
+        for (size_t i = 0; i < alignments.size(); ++i) {
+            if (i == best_index) continue;
+            const auto& aln = alignments[i];
+            bool is_supp = false;
+            for (const auto& s : supplementaries) {
+                if (aln.ref_id == s.ref_id && aln.ref_start == s.ref_start
+                    && aln.query_start == s.query_start && aln.query_end == s.query_end) {
+                    is_supp = true;
+                    break;
+                }
+            }
+            if (is_supp) continue;
+            auto key = std::make_tuple(aln.ref_id, aln.ref_start, aln.is_revcomp);
+            bool dup = false;
+            for (const auto& k : seen_xa) {
+                if (k == key) { dup = true; break; }
+            }
+            if (dup) continue;
+            seen_xa.push_back(key);
+            xa_entries += sam.format_xa_entry(aln);
+        }
+        if (!xa_entries.empty()) {
+            if (!extra_tags.empty()) extra_tags += '\t';
+            extra_tags += "XA:Z:";
+            extra_tags += xa_entries;
+        }
+    }
+
+    // Output primary alignment
+    sam.add(best_alignment, record, read.rc, mapq, PRIMARY, details, extra_tags);
 
     // Output supplementary alignments
     for (size_t i = 0; i < supplementaries.size(); ++i) {
@@ -1525,6 +1604,8 @@ void align_or_map_paired(
         if (alignment_pairs.size() == 1 && alignment_pairs[0].score == -1) {
             details[0].xp = 5;
             details[1].xp = 5;
+            details[0].yj = 1.0f;  // Only one pair on fast path
+            details[1].yj = 1.0f;
             Alignment& alignment1 = alignment_pairs[0].alignment1;
             Alignment& alignment2 = alignment_pairs[0].alignment2;
             bool is_proper = is_proper_pair(alignment1, alignment2, isize_est.mu, isize_est.sigma);
@@ -1565,6 +1646,23 @@ void align_or_map_paired(
                     if (!extra2.empty()) extra2 += '\t';
                     extra2 += sv_extra2;
                 }
+                // XD/XR: supplementary score delta/ratio
+                if (map_param.sv_tags) {
+                    if (!si1.supps.empty()) {
+                        auto dt = compute_supp_delta_tags(alignment1, si1.supps);
+                        if (!dt.empty()) {
+                            if (!extra1.empty()) extra1 += '\t';
+                            extra1 += dt;
+                        }
+                    }
+                    if (!si2.supps.empty()) {
+                        auto dt = compute_supp_delta_tags(alignment2, si2.supps);
+                        if (!dt.empty()) {
+                            if (!extra2.empty()) extra2 += '\t';
+                            extra2 += dt;
+                        }
+                    }
+                }
 
                 sam.add_pair(alignment1, alignment2, record1, record2, read1.rc, read2.rc, mapq1, mapq2, is_proper, PRIMARY, details, extra1, extra2);
 
@@ -1601,6 +1699,18 @@ void align_or_map_paired(
                 if (random_index != 0) {
                     std::swap(alignment_pairs[0], alignment_pairs[random_index]);
                 }
+            }
+
+            // Set XS (best non-primary alignment score per read) and YJ (pair posterior)
+            if (alignment_pairs.size() > 1) {
+                auto& second = alignment_pairs[1];
+                if (!second.alignment1.is_unaligned) details[0].xs = second.alignment1.score;
+                if (!second.alignment2.is_unaligned) details[1].xs = second.alignment2.score;
+            }
+            {
+                float posterior = compute_pair_posterior(alignment_pairs);
+                details[0].yj = posterior;
+                details[1].yj = posterior;
             }
 
             if (map_param.max_supplementary > 0 && !alignment_pairs.empty()) {
@@ -1655,6 +1765,23 @@ void align_or_map_paired(
                 if (!sv_extra2.empty()) {
                     if (!extra2.empty()) extra2 += '\t';
                     extra2 += sv_extra2;
+                }
+                // XD/XR: supplementary score delta/ratio
+                if (map_param.sv_tags) {
+                    if (!si1.supps.empty()) {
+                        auto dt = compute_supp_delta_tags(primary1, si1.supps);
+                        if (!dt.empty()) {
+                            if (!extra1.empty()) extra1 += '\t';
+                            extra1 += dt;
+                        }
+                    }
+                    if (!si2.supps.empty()) {
+                        auto dt = compute_supp_delta_tags(primary2, si2.supps);
+                        if (!dt.empty()) {
+                            if (!extra2.empty()) extra2 += '\t';
+                            extra2 += dt;
+                        }
+                    }
                 }
 
                 // Output primary pair with SA + SV tags
@@ -1772,7 +1899,7 @@ void align_or_map_single(
                 aligner, sam, nams, record, index_parameters.syncmer.k,
                 references, details, map_param.dropoff_threshold, map_param.max_tries,
                 map_param.max_secondary, map_param.max_supplementary,
-                map_param.max_supp_overlap, random_engine
+                map_param.max_supp_overlap, random_engine, map_param.sv_tags
             );
             break;
     }

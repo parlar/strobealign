@@ -154,6 +154,12 @@ void Sam::add(
     std::string combined_tags = compute_md_tag(alignment.cigar, alignment.ref_id, alignment.ref_start);
     combined_tags += "\tnn:i:";
     combined_tags += std::to_string(compute_nn(alignment.cigar, alignment.ref_id, alignment.ref_start));
+    {
+        char gc_buf[16];
+        std::snprintf(gc_buf, sizeof(gc_buf), "%.2f", compute_gc_fraction(alignment.cigar, alignment.ref_id, alignment.ref_start));
+        combined_tags += "\tXG:f:";
+        combined_tags += gc_buf;
+    }
     if (!extra_tags.empty()) {
         combined_tags += '\t';
         combined_tags += extra_tags;
@@ -259,6 +265,25 @@ void Sam::add_record(
         sam_string.append(std::to_string(details.s2));
         sam_string.append("\tXp:i:");
         sam_string.append(std::to_string(details.xp));
+        if (details.xs > 0) {
+            sam_string.append("\tXS:i:");
+            sam_string.append(std::to_string(details.xs));
+        }
+        if ((flags & PAIRED) && details.yj >= 0.0f) {
+            char yj_buf[16];
+            std::snprintf(yj_buf, sizeof(yj_buf), "%.4f", details.yj);
+            sam_string.append("\tYJ:f:");
+            sam_string.append(yj_buf);
+        }
+        {
+            float total = static_cast<float>(details.hits.total_hits());
+            float filtered = static_cast<float>(details.hits.total_filtered());
+            float xw = total > 0 ? 1.0f - (filtered / total) : 1.0f;
+            char xw_buf[16];
+            std::snprintf(xw_buf, sizeof(xw_buf), "%.2f", xw);
+            sam_string.append("\tXW:f:");
+            sam_string.append(xw_buf);
+        }
     } else {
         append_qual(qual);
     }
@@ -377,6 +402,12 @@ void Sam::add_pair(
         std::string combined_tags1 = compute_md_tag(alignment1.cigar, alignment1.ref_id, alignment1.ref_start);
         combined_tags1 += "\tnn:i:";
         combined_tags1 += std::to_string(compute_nn(alignment1.cigar, alignment1.ref_id, alignment1.ref_start));
+        {
+            char gc_buf[16];
+            std::snprintf(gc_buf, sizeof(gc_buf), "%.2f", compute_gc_fraction(alignment1.cigar, alignment1.ref_id, alignment1.ref_start));
+            combined_tags1 += "\tXG:f:";
+            combined_tags1 += gc_buf;
+        }
         if (!alignment2.is_unaligned) {
             combined_tags1 += '\t';
             combined_tags1 += compute_mc_tag(alignment2.cigar);
@@ -395,6 +426,12 @@ void Sam::add_pair(
         std::string combined_tags2 = compute_md_tag(alignment2.cigar, alignment2.ref_id, alignment2.ref_start);
         combined_tags2 += "\tnn:i:";
         combined_tags2 += std::to_string(compute_nn(alignment2.cigar, alignment2.ref_id, alignment2.ref_start));
+        {
+            char gc_buf[16];
+            std::snprintf(gc_buf, sizeof(gc_buf), "%.2f", compute_gc_fraction(alignment2.cigar, alignment2.ref_id, alignment2.ref_start));
+            combined_tags2 += "\tXG:f:";
+            combined_tags2 += gc_buf;
+        }
         if (!alignment1.is_unaligned) {
             combined_tags2 += '\t';
             combined_tags2 += compute_mc_tag(alignment1.cigar);
@@ -511,6 +548,46 @@ int Sam::compute_nn(const Cigar& cigar, int ref_id, int ref_start) const {
     return nn;
 }
 
+float Sam::compute_gc_fraction(const Cigar& cigar, int ref_id, int ref_start) const {
+    const auto& ref_seq = references.sequences[ref_id];
+    int ref_pos = ref_start;
+    int gc_count = 0;
+    int total_count = 0;
+    for (auto op_len : cigar.m_ops) {
+        auto op = op_len & 0xf;
+        auto len = op_len >> 4;
+        if (op == CIGAR_EQ || op == CIGAR_X || op == CIGAR_DEL) {
+            for (unsigned i = 0; i < len; ++i) {
+                if (ref_pos >= 0 && ref_pos < static_cast<int>(ref_seq.size())) {
+                    char c = ref_seq[ref_pos];
+                    if (c == 'G' || c == 'g' || c == 'C' || c == 'c') {
+                        gc_count++;
+                        total_count++;
+                    } else if (c != 'N' && c != 'n') {
+                        total_count++;
+                    }
+                }
+                ref_pos++;
+            }
+        }
+    }
+    return total_count > 0 ? static_cast<float>(gc_count) / total_count : 0.0f;
+}
+
+std::string Sam::format_xa_entry(const Alignment& alignment) const {
+    std::string entry;
+    entry.append(references.names[alignment.ref_id]);
+    entry.append(",");
+    entry.append(alignment.is_revcomp ? "-" : "+");
+    entry.append(std::to_string(alignment.ref_start + 1));  // 1-based
+    entry.append(",");
+    entry.append(cigar_string(alignment.cigar));
+    entry.append(",");
+    entry.append(std::to_string(alignment.edit_distance));
+    entry.append(";");
+    return entry;
+}
+
 std::string Sam::format_sa_entry(const Alignment& alignment, uint8_t mapq) const {
     std::string entry;
     entry.append(references.names[alignment.ref_id]);
@@ -566,6 +643,12 @@ void Sam::add_paired_supplementary(
     std::string combined_tags = compute_md_tag(alignment.cigar, alignment.ref_id, alignment.ref_start);
     combined_tags += "\tnn:i:";
     combined_tags += std::to_string(compute_nn(alignment.cigar, alignment.ref_id, alignment.ref_start));
+    {
+        char gc_buf[16];
+        std::snprintf(gc_buf, sizeof(gc_buf), "%.2f", compute_gc_fraction(alignment.cigar, alignment.ref_id, alignment.ref_start));
+        combined_tags += "\tXG:f:";
+        combined_tags += gc_buf;
+    }
     if (!mate_primary.is_unaligned) {
         combined_tags += '\t';
         combined_tags += compute_mc_tag(mate_primary.cigar);

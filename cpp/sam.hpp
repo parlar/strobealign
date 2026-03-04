@@ -98,6 +98,13 @@ public:
 
     /* Count N bases in aligned reference span */
     int compute_nn(const Cigar& cigar, int ref_id, int ref_start) const;
+
+    /* Compute GC fraction of aligned reference span (excluding N bases) */
+    float compute_gc_fraction(const Cigar& cigar, int ref_id, int ref_start) const;
+
+    /* Format an XA tag entry for one alignment: rname,+/-pos,CIGAR,NM; */
+    std::string format_xa_entry(const Alignment& alignment) const;
+
     void add_unmapped(const klibpp::KSeq& record, uint16_t flags = UNMAP);
     void add_unmapped_pair(const klibpp::KSeq& r1, const klibpp::KSeq& r2);
     void add_unmapped_mate(const klibpp::KSeq& record, uint16_t flags, const std::string& mate_reference_name, uint32_t mate_pos);
