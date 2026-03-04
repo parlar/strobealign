@@ -88,7 +88,13 @@ public:
     std::string format_sa_entry(const Alignment& alignment, uint8_t mapq) const;
 
     /* Add a supplementary alignment for one read of a pair */
-    void add_paired_supplementary(const Alignment& alignment, const klibpp::KSeq& record, const std::string& read_rc, uint8_t mapq, bool is_read1, const Alignment& mate_primary, const Details& details, const std::string& extra_tags = "");
+    void add_paired_supplementary(const Alignment& alignment, const klibpp::KSeq& record, const std::string& read_rc, uint8_t mapq, bool is_read1, const Alignment& mate_primary, uint8_t mate_mapq, const Details& details, const std::string& extra_tags = "");
+
+    /* Generate MD:Z tag string from internal EQX cigar + reference */
+    std::string compute_md_tag(const Cigar& cigar, int ref_id, int ref_start) const;
+
+    /* Generate MC:Z tag string (mate CIGAR, respects M vs EQX output setting) */
+    std::string compute_mc_tag(const Cigar& cigar) const;
     void add_unmapped(const klibpp::KSeq& record, uint16_t flags = UNMAP);
     void add_unmapped_pair(const klibpp::KSeq& r1, const klibpp::KSeq& r2);
     void add_unmapped_mate(const klibpp::KSeq& record, uint16_t flags, const std::string& mate_reference_name, uint32_t mate_pos);

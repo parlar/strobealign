@@ -1,6 +1,7 @@
 #include "aln.hpp"
 
 #include <algorithm>
+#include <cstdio>
 #include <numeric>
 #include <math.h>
 #include "chain.hpp"
@@ -65,6 +66,120 @@ std::vector<Alignment> select_supplementary(
         }
     }
     return supplementaries;
+}
+
+/*
+ * Compute YT pair-type tag for SV calling:
+ *   UU - both unmapped
+ *   IC - inter-chromosomal (different references)
+ *   DO - deviant orientation (same reference, same strand)
+ *   CP - concordant pair (matches is_proper_pair: inward FR, insert <= mu + 6σ)
+ *   DI - deviant insert size (opposite strands but not concordant)
+ *
+ * Returns empty string when exactly one read is unmapped (no useful SV signal).
+ * CP classification uses is_proper_pair() to stay consistent with the PROPER_PAIR flag.
+ */
+std::string compute_yt_tag(
+    const Alignment& a1, const Alignment& a2, float mu, float sigma
+) {
+    if (a1.is_unaligned && a2.is_unaligned) {
+        return "YT:Z:UU";
+    }
+    if (a1.is_unaligned || a2.is_unaligned) {
+        return "";
+    }
+    if (a1.ref_id != a2.ref_id) {
+        return "YT:Z:IC";
+    }
+    // Same chromosome, same strand → deviant orientation
+    if (a1.is_revcomp == a2.is_revcomp) {
+        return "YT:Z:DO";
+    }
+    // Opposite strands — use is_proper_pair for CP to match PROPER_PAIR flag
+    if (is_proper_pair(a1, a2, mu, sigma)) {
+        return "YT:Z:CP";
+    }
+    return "YT:Z:DI";
+}
+
+/*
+ * Compute YD insert-size Z-score: |insert_size - mu| / sigma
+ * Only meaningful when both reads map to the same chromosome.
+ */
+std::string compute_yd_tag(
+    const Alignment& a1, const Alignment& a2, float mu, float sigma
+) {
+    if (a1.is_unaligned || a2.is_unaligned) return "";
+    if (a1.ref_id != a2.ref_id) return "";
+    if (sigma <= 0) return "";
+    int insert = std::abs(a2.ref_start - a1.ref_start);
+    float zscore = std::abs(insert - mu) / sigma;
+    // Format with 2 decimal places
+    char buf[32];
+    std::snprintf(buf, sizeof(buf), "YD:f:%.2f", zscore);
+    return buf;
+}
+
+/*
+ * Compute Xr rescue-status tag:
+ *   0 - full search (normal alignment, not fast path and no rescue)
+ *   1 - fast path (score == -1 in alignment pairs)
+ *   2 - mate was rescued
+ */
+std::string compute_xr_tag(const Details& details, bool is_fast_path) {
+    if (details.mate_rescue > 0) {
+        return "Xr:i:2";
+    }
+    if (is_fast_path) {
+        return "Xr:i:1";
+    }
+    return "Xr:i:0";
+}
+
+/*
+ * Compute YS SV-type tag for supplementary vs primary:
+ *   TRA - different chromosomes (translocation)
+ *   INV - same chromosome, different strands (inversion)
+ *   DUP - same chromosome, same strand, reference ranges overlap (duplication)
+ *   DEL - same chromosome, same strand, no reference overlap (deletion)
+ */
+std::string compute_ys_tag(const Alignment& supp, const Alignment& primary) {
+    if (supp.ref_id != primary.ref_id) {
+        return "YS:Z:TRA";
+    }
+    if (supp.is_revcomp != primary.is_revcomp) {
+        return "YS:Z:INV";
+    }
+    // Same chromosome, same strand — check for reference overlap
+    int supp_end = supp.ref_start + supp.length;
+    int prim_end = primary.ref_start + primary.length;
+    bool overlap = (supp.ref_start < prim_end && primary.ref_start < supp_end);
+    return overlap ? "YS:Z:DUP" : "YS:Z:DEL";
+}
+
+/*
+ * Build SV extra_tags string for a paired-end read.
+ * Combines YT + YD + Xr tags, tab-separated.
+ */
+std::string build_sv_tags(
+    const Alignment& a1, const Alignment& a2,
+    float mu, float sigma,
+    const Details& details, bool is_fast_path
+) {
+    std::string tags;
+    auto yt = compute_yt_tag(a1, a2, mu, sigma);
+    if (!yt.empty()) {
+        tags = yt;
+    }
+    auto yd = compute_yd_tag(a1, a2, mu, sigma);
+    if (!yd.empty()) {
+        if (!tags.empty()) tags += '\t';
+        tags += yd;
+    }
+    auto xr = compute_xr_tag(details, is_fast_path);
+    if (!tags.empty()) tags += '\t';
+    tags += xr;
+    return tags;
 }
 
 struct NamPair {
@@ -889,7 +1004,8 @@ void output_aligned_pairs(
     const Read& read2,
     float mu,
     float sigma,
-    const std::array<Details, 2>& details
+    const std::array<Details, 2>& details,
+    bool sv_tags
 ) {
 
     if (high_scores.empty()) {
@@ -905,7 +1021,12 @@ void output_aligned_pairs(
         Alignment alignment1 = best_aln_pair.alignment1;
         Alignment alignment2 = best_aln_pair.alignment2;
 
-        sam.add_pair(alignment1, alignment2, record1, record2, read1.rc, read2.rc, mapq1, mapq2, is_proper_pair(alignment1, alignment2, mu, sigma), PRIMARY, details);
+        std::string extra1, extra2;
+        if (sv_tags) {
+            extra1 = build_sv_tags(alignment1, alignment2, mu, sigma, details[0], false);
+            extra2 = build_sv_tags(alignment1, alignment2, mu, sigma, details[1], false);
+        }
+        sam.add_pair(alignment1, alignment2, record1, record2, read1.rc, read2.rc, mapq1, mapq2, is_proper_pair(alignment1, alignment2, mu, sigma), PRIMARY, details, extra1, extra2);
     } else {
         auto max_out = std::min(high_scores.size(), max_secondary);
         AlignmentType aln_type = PRIMARY;
@@ -922,7 +1043,12 @@ void output_aligned_pairs(
             }
             if (s_max - s_score < secondary_dropoff) {
                 bool is_proper = is_proper_pair(alignment1, alignment2, mu, sigma);
-                sam.add_pair(alignment1, alignment2, record1, record2, read1.rc, read2.rc, mapq1, mapq2, is_proper, aln_type, details);
+                std::string extra1, extra2;
+                if (sv_tags && i == 0) {
+                    extra1 = build_sv_tags(alignment1, alignment2, mu, sigma, details[0], false);
+                    extra2 = build_sv_tags(alignment1, alignment2, mu, sigma, details[1], false);
+                }
+                sam.add_pair(alignment1, alignment2, record1, record2, read1.rc, read2.rc, mapq1, mapq2, is_proper, aln_type, details, extra1, extra2);
             } else {
                 break;
             }
@@ -1408,21 +1534,50 @@ void align_or_map_paired(
             details[0].best_alignments = 1;
             details[1].best_alignments = 1;
 
+            // Build SV extra tags if requested
+            std::string sv_extra1, sv_extra2;
+            if (map_param.sv_tags) {
+                sv_extra1 = build_sv_tags(alignment1, alignment2, isize_est.mu, isize_est.sigma, details[0], true);
+                sv_extra2 = build_sv_tags(alignment1, alignment2, isize_est.mu, isize_est.sigma, details[1], true);
+            }
+
             if (map_param.max_supplementary > 0) {
                 auto k = index_parameters.syncmer.k;
                 auto si1 = build_supplementary_info(sam, aligner, nams_pair[0], read1, alignment1, mapq1, k, references, map_param.dropoff_threshold, map_param.max_tries, map_param.max_supplementary, map_param.max_supp_overlap);
                 auto si2 = build_supplementary_info(sam, aligner, nams_pair[1], read2, alignment2, mapq2, k, references, map_param.dropoff_threshold, map_param.max_tries, map_param.max_supplementary, map_param.max_supp_overlap);
 
-                sam.add_pair(alignment1, alignment2, record1, record2, read1.rc, read2.rc, mapq1, mapq2, is_proper, PRIMARY, details, si1.primary_sa_tag, si2.primary_sa_tag);
+                // Combine SA tags with SV tags
+                std::string extra1 = si1.primary_sa_tag;
+                std::string extra2 = si2.primary_sa_tag;
+                if (!sv_extra1.empty()) {
+                    if (!extra1.empty()) extra1 += '\t';
+                    extra1 += sv_extra1;
+                }
+                if (!sv_extra2.empty()) {
+                    if (!extra2.empty()) extra2 += '\t';
+                    extra2 += sv_extra2;
+                }
+
+                sam.add_pair(alignment1, alignment2, record1, record2, read1.rc, read2.rc, mapq1, mapq2, is_proper, PRIMARY, details, extra1, extra2);
 
                 for (size_t j = 0; j < si1.supps.size(); ++j) {
-                    sam.add_paired_supplementary(si1.supps[j], record1, read1.rc, mapq1, true, alignment2, details[0], si1.supp_sa_tags[j]);
+                    std::string supp_extra = si1.supp_sa_tags[j];
+                    if (map_param.sv_tags) {
+                        if (!supp_extra.empty()) supp_extra += '\t';
+                        supp_extra += compute_ys_tag(si1.supps[j], alignment1);
+                    }
+                    sam.add_paired_supplementary(si1.supps[j], record1, read1.rc, mapq1, true, alignment2, mapq2, details[0], supp_extra);
                 }
                 for (size_t j = 0; j < si2.supps.size(); ++j) {
-                    sam.add_paired_supplementary(si2.supps[j], record2, read2.rc, mapq2, false, alignment1, details[1], si2.supp_sa_tags[j]);
+                    std::string supp_extra = si2.supp_sa_tags[j];
+                    if (map_param.sv_tags) {
+                        if (!supp_extra.empty()) supp_extra += '\t';
+                        supp_extra += compute_ys_tag(si2.supps[j], alignment2);
+                    }
+                    sam.add_paired_supplementary(si2.supps[j], record2, read2.rc, mapq2, false, alignment1, mapq1, details[1], supp_extra);
                 }
             } else {
-                sam.add_pair(alignment1, alignment2, record1, record2, read1.rc, read2.rc, mapq1, mapq2, is_proper, PRIMARY, details);
+                sam.add_pair(alignment1, alignment2, record1, record2, read1.rc, read2.rc, mapq1, mapq2, is_proper, PRIMARY, details, sv_extra1, sv_extra2);
             }
         } else {
             std::sort(alignment_pairs.begin(), alignment_pairs.end(), by_score<ScoredAlignmentPair>);
@@ -1475,15 +1630,44 @@ void align_or_map_paired(
                 auto si1 = build_supplementary_info_from_candidates(sam, candidates1, primary1, mapq1, map_param.max_supplementary, map_param.max_supp_overlap, record1.seq.length(), k);
                 auto si2 = build_supplementary_info_from_candidates(sam, candidates2, primary2, mapq2, map_param.max_supplementary, map_param.max_supp_overlap, record2.seq.length(), k);
 
-                // Output primary pair with SA tags
-                sam.add_pair(primary1, primary2, record1, record2, read1.rc, read2.rc, mapq1, mapq2, is_proper, PRIMARY, details, si1.primary_sa_tag, si2.primary_sa_tag);
+                // Build SV extra tags if requested
+                std::string sv_extra1, sv_extra2;
+                if (map_param.sv_tags) {
+                    sv_extra1 = build_sv_tags(primary1, primary2, isize_est.mu, isize_est.sigma, details[0], false);
+                    sv_extra2 = build_sv_tags(primary1, primary2, isize_est.mu, isize_est.sigma, details[1], false);
+                }
+
+                // Combine SA tags with SV tags
+                std::string extra1 = si1.primary_sa_tag;
+                std::string extra2 = si2.primary_sa_tag;
+                if (!sv_extra1.empty()) {
+                    if (!extra1.empty()) extra1 += '\t';
+                    extra1 += sv_extra1;
+                }
+                if (!sv_extra2.empty()) {
+                    if (!extra2.empty()) extra2 += '\t';
+                    extra2 += sv_extra2;
+                }
+
+                // Output primary pair with SA + SV tags
+                sam.add_pair(primary1, primary2, record1, record2, read1.rc, read2.rc, mapq1, mapq2, is_proper, PRIMARY, details, extra1, extra2);
 
                 // Output supplementary records
                 for (size_t j = 0; j < si1.supps.size(); ++j) {
-                    sam.add_paired_supplementary(si1.supps[j], record1, read1.rc, mapq1, true, primary2, details[0], si1.supp_sa_tags[j]);
+                    std::string supp_extra = si1.supp_sa_tags[j];
+                    if (map_param.sv_tags) {
+                        if (!supp_extra.empty()) supp_extra += '\t';
+                        supp_extra += compute_ys_tag(si1.supps[j], primary1);
+                    }
+                    sam.add_paired_supplementary(si1.supps[j], record1, read1.rc, mapq1, true, primary2, mapq2, details[0], supp_extra);
                 }
                 for (size_t j = 0; j < si2.supps.size(); ++j) {
-                    sam.add_paired_supplementary(si2.supps[j], record2, read2.rc, mapq2, false, primary1, details[1], si2.supp_sa_tags[j]);
+                    std::string supp_extra = si2.supp_sa_tags[j];
+                    if (map_param.sv_tags) {
+                        if (!supp_extra.empty()) supp_extra += '\t';
+                        supp_extra += compute_ys_tag(si2.supps[j], primary2);
+                    }
+                    sam.add_paired_supplementary(si2.supps[j], record2, read2.rc, mapq2, false, primary1, mapq1, details[1], supp_extra);
                 }
 
                 // Output secondary pairs
@@ -1509,7 +1693,8 @@ void align_or_map_paired(
                     read2,
                     isize_est.mu,
                     isize_est.sigma,
-                    details
+                    details,
+                    map_param.sv_tags
                 );
             }
         }

@@ -35,6 +35,7 @@ struct MappingParameters {
     bool details{false};
     bool fastq_comments{false};
 
+    bool sv_tags{false};
     bool use_nams{false};
     ChainingParameters chaining_params;
 

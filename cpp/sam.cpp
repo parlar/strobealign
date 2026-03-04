@@ -1,5 +1,6 @@
 #include "sam.hpp"
 #include <algorithm>
+#include <cctype>
 #include <ostream>
 #include <sstream>
 #include <iostream>
@@ -149,7 +150,12 @@ void Sam::add(
     if (aln_type == SUPPLEMENTARY_ALN) {
         flags |= SUPPLEMENTARY;
     }
-    add_record(record.name, record.comment, flags, references.names[alignment.ref_id], alignment.ref_start, mapq, alignment.cigar, "*", -1, 0, record.seq, sequence_rc, record.qual, alignment.edit_distance, alignment.score, details, extra_tags);
+    std::string combined_tags = compute_md_tag(alignment.cigar, alignment.ref_id, alignment.ref_start);
+    if (!extra_tags.empty()) {
+        combined_tags += '\t';
+        combined_tags += extra_tags;
+    }
+    add_record(record.name, record.comment, flags, references.names[alignment.ref_id], alignment.ref_start, mapq, alignment.cigar, "*", -1, 0, record.seq, sequence_rc, record.qual, alignment.edit_distance, alignment.score, details, combined_tags);
 }
 
 // Add one individual record
@@ -331,12 +337,34 @@ void Sam::add_pair(
     if (alignment1.is_unaligned) {
         add_unmapped_mate(record1, f1, reference_name2, pos2);
     } else {
-        add_record(record1.name, record1.comment, f1, reference_name1, alignment1.ref_start, mapq1, alignment1.cigar, mate_reference_name2, pos2, template_len1, record1.seq, read1_rc, record1.qual, edit_distance1, alignment1.score, details[0], extra_tags1);
+        std::string combined_tags1 = compute_md_tag(alignment1.cigar, alignment1.ref_id, alignment1.ref_start);
+        if (!alignment2.is_unaligned) {
+            combined_tags1 += '\t';
+            combined_tags1 += compute_mc_tag(alignment2.cigar);
+            combined_tags1 += "\tMQ:i:";
+            combined_tags1 += std::to_string(mapq2);
+        }
+        if (!extra_tags1.empty()) {
+            combined_tags1 += '\t';
+            combined_tags1 += extra_tags1;
+        }
+        add_record(record1.name, record1.comment, f1, reference_name1, alignment1.ref_start, mapq1, alignment1.cigar, mate_reference_name2, pos2, template_len1, record1.seq, read1_rc, record1.qual, edit_distance1, alignment1.score, details[0], combined_tags1);
     }
     if (alignment2.is_unaligned) {
         add_unmapped_mate(record2, f2, reference_name1, pos1);
     } else {
-        add_record(record2.name, record2.comment, f2, reference_name2, alignment2.ref_start, mapq2, alignment2.cigar, mate_reference_name1, pos1, -template_len1, record2.seq, read2_rc, record2.qual, edit_distance2, alignment2.score, details[1], extra_tags2);
+        std::string combined_tags2 = compute_md_tag(alignment2.cigar, alignment2.ref_id, alignment2.ref_start);
+        if (!alignment1.is_unaligned) {
+            combined_tags2 += '\t';
+            combined_tags2 += compute_mc_tag(alignment1.cigar);
+            combined_tags2 += "\tMQ:i:";
+            combined_tags2 += std::to_string(mapq1);
+        }
+        if (!extra_tags2.empty()) {
+            combined_tags2 += '\t';
+            combined_tags2 += extra_tags2;
+        }
+        add_record(record2.name, record2.comment, f2, reference_name2, alignment2.ref_start, mapq2, alignment2.cigar, mate_reference_name1, pos1, -template_len1, record2.seq, read2_rc, record2.qual, edit_distance2, alignment2.score, details[1], combined_tags2);
     }
 }
 
@@ -370,6 +398,57 @@ std::ostream& operator<<(std::ostream& os, const Alignment& alignment) {
     return os;
 }
 
+std::string Sam::compute_md_tag(const Cigar& cigar, int ref_id, int ref_start) const {
+    std::string md = "MD:Z:";
+    const auto& ref_seq = references.sequences[ref_id];
+    int ref_pos = ref_start;
+    int match_count = 0;
+
+    for (auto op_len : cigar.m_ops) {
+        auto op = op_len & 0xf;
+        auto len = op_len >> 4;
+
+        switch (op) {
+            case CIGAR_EQ:
+                match_count += len;
+                ref_pos += len;
+                break;
+            case CIGAR_X:
+                for (unsigned i = 0; i < len; ++i) {
+                    assert(ref_pos >= 0 && ref_pos < static_cast<int>(ref_seq.size()));
+                    md += std::to_string(match_count);
+                    match_count = 0;
+                    md += static_cast<char>(std::toupper(ref_seq[ref_pos]));
+                    ref_pos++;
+                }
+                break;
+            case CIGAR_DEL:
+                md += std::to_string(match_count);
+                match_count = 0;
+                md += '^';
+                for (unsigned i = 0; i < len; ++i) {
+                    assert(ref_pos >= 0 && ref_pos < static_cast<int>(ref_seq.size()));
+                    md += static_cast<char>(std::toupper(ref_seq[ref_pos]));
+                    ref_pos++;
+                }
+                break;
+            case CIGAR_INS:
+            case CIGAR_SOFTCLIP:
+                break;
+            default:
+                // Internal cigars should always use EQ/X, not M
+                assert(op != CIGAR_MATCH && "compute_md_tag requires EQ/X cigar, not M");
+                break;
+        }
+    }
+    md += std::to_string(match_count);
+    return md;
+}
+
+std::string Sam::compute_mc_tag(const Cigar& cigar) const {
+    return "MC:Z:" + cigar_string(cigar);
+}
+
 std::string Sam::format_sa_entry(const Alignment& alignment, uint8_t mapq) const {
     std::string entry;
     entry.append(references.names[alignment.ref_id]);
@@ -394,6 +473,7 @@ void Sam::add_paired_supplementary(
     uint8_t mapq,
     bool is_read1,
     const Alignment& mate_primary,
+    uint8_t mate_mapq,
     const Details& details,
     const std::string& extra_tags
 ) {
@@ -421,6 +501,18 @@ void Sam::add_paired_supplementary(
         mate_pos = mate_primary.ref_start;
     }
 
+    std::string combined_tags = compute_md_tag(alignment.cigar, alignment.ref_id, alignment.ref_start);
+    if (!mate_primary.is_unaligned) {
+        combined_tags += '\t';
+        combined_tags += compute_mc_tag(mate_primary.cigar);
+        combined_tags += "\tMQ:i:";
+        combined_tags += std::to_string(mate_mapq);
+    }
+    if (!extra_tags.empty()) {
+        combined_tags += '\t';
+        combined_tags += extra_tags;
+    }
+
     add_record(
         record.name, record.comment, flags,
         references.names[alignment.ref_id], alignment.ref_start,
@@ -428,6 +520,6 @@ void Sam::add_paired_supplementary(
         0, // TLEN = 0 for supplementary
         record.seq, read_rc, record.qual,
         alignment.edit_distance, alignment.score,
-        details, extra_tags
+        details, combined_tags
     );
 }

@@ -206,6 +206,7 @@ int run_strobealign(int argc, char **argv) {
     map_param.output_unmapped = opt.output_unmapped;
     map_param.details = opt.details;
     map_param.fastq_comments = opt.fastq_comments;
+    map_param.sv_tags = opt.sv_tags;
     map_param.use_nams = opt.nams;
     map_param.chaining_params.max_lookback = opt.max_lookback;
     map_param.chaining_params.diag_diff_penalty = opt.diag_diff_penalty;
