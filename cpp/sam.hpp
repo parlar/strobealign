@@ -90,17 +90,20 @@ public:
     /* Add a supplementary alignment for one read of a pair */
     void add_paired_supplementary(const Alignment& alignment, const klibpp::KSeq& record, const std::string& read_rc, uint8_t mapq, bool is_read1, const Alignment& mate_primary, uint8_t mate_mapq, const Details& details, const std::string& extra_tags = "");
 
-    /* Generate MD:Z tag string from internal EQX cigar + reference */
-    std::string compute_md_tag(const Cigar& cigar, int ref_id, int ref_start) const;
+    /* Results from single-pass CIGAR walk computing MD, nn, XG, and aligned_len */
+    struct CigarTagResults {
+        std::string md;      // "MD:Z:..." tag string
+        int nn{0};           // Count of N bases in aligned reference span
+        int gc_count{0};     // G/C bases in aligned span
+        int gc_total{0};     // Non-N bases in aligned span
+        int aligned_len{0};  // EQ+X+INS+DEL length (for de tag)
+    };
+
+    /* Single-pass CIGAR walk: computes MD tag, nn count, GC stats, and aligned_len */
+    CigarTagResults compute_cigar_tags(const Cigar& cigar, int ref_id, int ref_start) const;
 
     /* Generate MC:Z tag string (mate CIGAR, respects M vs EQX output setting) */
     std::string compute_mc_tag(const Cigar& cigar) const;
-
-    /* Count N bases in aligned reference span */
-    int compute_nn(const Cigar& cigar, int ref_id, int ref_start) const;
-
-    /* Compute GC fraction of aligned reference span (excluding N bases) */
-    float compute_gc_fraction(const Cigar& cigar, int ref_id, int ref_start) const;
 
     /* Format an XA tag entry for one alignment: rname,+/-pos,CIGAR,NM; */
     std::string format_xa_entry(const Alignment& alignment) const;
@@ -110,7 +113,7 @@ public:
     void add_unmapped_mate(const klibpp::KSeq& record, uint16_t flags, const std::string& mate_reference_name, uint32_t mate_pos);
 
 private:
-    void add_record(const std::string& query_name, const std::string& comment, uint16_t flags, const std::string& reference_name, uint32_t pos, uint8_t mapq, const Cigar& cigar, const std::string& mate_reference_name, uint32_t mate_pos, int32_t template_len, const std::string& query_sequence, const std::string& query_sequence_rc, const std::string& qual, int ed, int aln_score, const Details& details, const std::string& extra_tags = "");
+    void add_record(const std::string& query_name, const std::string& comment, uint16_t flags, const std::string& reference_name, uint32_t pos, uint8_t mapq, const Cigar& cigar, const std::string& mate_reference_name, uint32_t mate_pos, int32_t template_len, const std::string& query_sequence, const std::string& query_sequence_rc, const std::string& qual, int ed, int aln_score, const Details& details, const std::string& extra_tags = "", int aligned_len = 0);
 
     void append_seq(const std::string& seq) {
         sam_string.append(seq.empty() ? "*" : seq);

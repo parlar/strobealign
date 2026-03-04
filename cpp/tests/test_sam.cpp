@@ -227,62 +227,62 @@ TEST_CASE("MD tag generation") {
 
     SUBCASE("all matches") {
         Cigar cigar("5=");
-        CHECK(sam.compute_md_tag(cigar, 0, 0) == "MD:Z:5");
+        CHECK(sam.compute_cigar_tags(cigar, 0, 0).md == "MD:Z:5");
     }
 
     SUBCASE("single mismatch") {
         // ref[2]='C'
         Cigar cigar("2=1X2=");
-        CHECK(sam.compute_md_tag(cigar, 0, 0) == "MD:Z:2C2");
+        CHECK(sam.compute_cigar_tags(cigar, 0, 0).md == "MD:Z:2C2");
     }
 
     SUBCASE("consecutive mismatches") {
         // ref[1]='A', ref[2]='C'
         Cigar cigar("1=2X2=");
-        CHECK(sam.compute_md_tag(cigar, 0, 0) == "MD:Z:1A0C2");
+        CHECK(sam.compute_cigar_tags(cigar, 0, 0).md == "MD:Z:1A0C2");
     }
 
     SUBCASE("deletion") {
         // ref[2]='C', ref[3]='C'
         Cigar cigar("2=2D2=");
-        CHECK(sam.compute_md_tag(cigar, 0, 0) == "MD:Z:2^CC2");
+        CHECK(sam.compute_cigar_tags(cigar, 0, 0).md == "MD:Z:2^CC2");
     }
 
     SUBCASE("insertion") {
         // Insertions consume query but not reference, invisible in MD
         Cigar cigar("2=2I3=");
-        CHECK(sam.compute_md_tag(cigar, 0, 0) == "MD:Z:5");
+        CHECK(sam.compute_cigar_tags(cigar, 0, 0).md == "MD:Z:5");
     }
 
     SUBCASE("soft clip") {
         // Soft clips don't consume reference
         Cigar cigar("2S3=");
-        CHECK(sam.compute_md_tag(cigar, 0, 0) == "MD:Z:3");
+        CHECK(sam.compute_cigar_tags(cigar, 0, 0).md == "MD:Z:3");
     }
 
     SUBCASE("mismatch at start") {
         // ref[0]='A'
         Cigar cigar("1X4=");
-        CHECK(sam.compute_md_tag(cigar, 0, 0) == "MD:Z:0A4");
+        CHECK(sam.compute_cigar_tags(cigar, 0, 0).md == "MD:Z:0A4");
     }
 
     SUBCASE("mismatch at end") {
         // ref[4]='G'
         Cigar cigar("4=1X");
-        CHECK(sam.compute_md_tag(cigar, 0, 0) == "MD:Z:4G0");
+        CHECK(sam.compute_cigar_tags(cigar, 0, 0).md == "MD:Z:4G0");
     }
 
     SUBCASE("with ref_start offset") {
         // Starting at ref pos 3: ref[3]='C', ref[4]='G', ref[5]='G'
         Cigar cigar("1X1=1X");
-        CHECK(sam.compute_md_tag(cigar, 0, 3) == "MD:Z:0C1G0");
+        CHECK(sam.compute_cigar_tags(cigar, 0, 3).md == "MD:Z:0C1G0");
     }
 
     SUBCASE("deletion after mismatch") {
         // ref[0]='A' (mismatch), then ref[1..2]='AC' (deletion), then ref[3..4]='CG' (match)
         // Zero between mismatch and deletion is required by SAM spec
         Cigar cigar("1X2D2=");
-        CHECK(sam.compute_md_tag(cigar, 0, 0) == "MD:Z:0A0^AC2");
+        CHECK(sam.compute_cigar_tags(cigar, 0, 0).md == "MD:Z:0A0^AC2");
     }
 
     SUBCASE("complex: soft clip + match + mismatch + deletion + match") {
@@ -296,7 +296,7 @@ TEST_CASE("MD tag generation") {
         // 1D at ref[4]='G': emit "0", emit "^G", ref_pos=5
         // 2= at ref[5..6]: match=2, ref_pos=7
         Cigar cigar("1S3=1X1D2=");
-        CHECK(sam.compute_md_tag(cigar, 0, 0) == "MD:Z:3C0^G2");
+        CHECK(sam.compute_cigar_tags(cigar, 0, 0).md == "MD:Z:3C0^G2");
     }
 }
 
