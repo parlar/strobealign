@@ -1485,6 +1485,7 @@ void align_or_map_paired(
         if (!nams_pair[is_r1].empty()) {
             details[is_r1].s1 = std::lroundf(nams_pair[is_r1][0].score);
             if (nams_pair[is_r1].size() > 1) details[is_r1].s2 = std::lroundf(nams_pair[is_r1][1].score);
+            details[is_r1].cm = nams_pair[is_r1][0].n_matches;
         }
     }
 
@@ -1522,6 +1523,8 @@ void align_or_map_paired(
         // -1 marks the typical case that both reads map uniquely and form a
         // proper pair. Then the mapping quality is computed based on the NAMs.
         if (alignment_pairs.size() == 1 && alignment_pairs[0].score == -1) {
+            details[0].xp = 5;
+            details[1].xp = 5;
             Alignment& alignment1 = alignment_pairs[0].alignment1;
             Alignment& alignment2 = alignment_pairs[0].alignment2;
             bool is_proper = is_proper_pair(alignment1, alignment2, isize_est.mu, isize_est.sigma);
@@ -1731,6 +1734,7 @@ void align_or_map_single(
     if (!nams.empty()) {
         details.s1 = std::lroundf(nams[0].score);
         if (nams.size() > 1) details.s2 = std::lroundf(nams[1].score);
+        details.cm = nams[0].n_matches;
     }
 
     Timer extend_timer;

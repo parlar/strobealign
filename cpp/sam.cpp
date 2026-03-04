@@ -152,6 +152,8 @@ void Sam::add(
         flags |= SUPPLEMENTARY;
     }
     std::string combined_tags = compute_md_tag(alignment.cigar, alignment.ref_id, alignment.ref_start);
+    combined_tags += "\tnn:i:";
+    combined_tags += std::to_string(compute_nn(alignment.cigar, alignment.ref_id, alignment.ref_start));
     if (!extra_tags.empty()) {
         combined_tags += '\t';
         combined_tags += extra_tags;
@@ -249,10 +251,14 @@ void Sam::add_record(
         sam_string.append(std::to_string(query_sequence.length()));
         sam_string.append("\ttp:A:");
         sam_string.append(1, (flags & (SECONDARY | SUPPLEMENTARY)) ? 'S' : 'P');
+        sam_string.append("\tcm:i:");
+        sam_string.append(std::to_string(details.cm));
         sam_string.append("\ts1:i:");
         sam_string.append(std::to_string(details.s1));
         sam_string.append("\ts2:i:");
         sam_string.append(std::to_string(details.s2));
+        sam_string.append("\tXp:i:");
+        sam_string.append(std::to_string(details.xp));
     } else {
         append_qual(qual);
     }
@@ -369,6 +375,8 @@ void Sam::add_pair(
         add_unmapped_mate(record1, f1, reference_name2, pos2);
     } else {
         std::string combined_tags1 = compute_md_tag(alignment1.cigar, alignment1.ref_id, alignment1.ref_start);
+        combined_tags1 += "\tnn:i:";
+        combined_tags1 += std::to_string(compute_nn(alignment1.cigar, alignment1.ref_id, alignment1.ref_start));
         if (!alignment2.is_unaligned) {
             combined_tags1 += '\t';
             combined_tags1 += compute_mc_tag(alignment2.cigar);
@@ -385,6 +393,8 @@ void Sam::add_pair(
         add_unmapped_mate(record2, f2, reference_name1, pos1);
     } else {
         std::string combined_tags2 = compute_md_tag(alignment2.cigar, alignment2.ref_id, alignment2.ref_start);
+        combined_tags2 += "\tnn:i:";
+        combined_tags2 += std::to_string(compute_nn(alignment2.cigar, alignment2.ref_id, alignment2.ref_start));
         if (!alignment1.is_unaligned) {
             combined_tags2 += '\t';
             combined_tags2 += compute_mc_tag(alignment1.cigar);
@@ -480,6 +490,27 @@ std::string Sam::compute_mc_tag(const Cigar& cigar) const {
     return "MC:Z:" + cigar_string(cigar);
 }
 
+int Sam::compute_nn(const Cigar& cigar, int ref_id, int ref_start) const {
+    const auto& ref_seq = references.sequences[ref_id];
+    int ref_pos = ref_start;
+    int nn = 0;
+    for (auto op_len : cigar.m_ops) {
+        auto op = op_len & 0xf;
+        auto len = op_len >> 4;
+        if (op == CIGAR_EQ || op == CIGAR_X || op == CIGAR_DEL) {
+            for (unsigned i = 0; i < len; ++i) {
+                if (ref_pos >= 0 && ref_pos < static_cast<int>(ref_seq.size())
+                    && (ref_seq[ref_pos] == 'N' || ref_seq[ref_pos] == 'n')) {
+                    nn++;
+                }
+                ref_pos++;
+            }
+        }
+        // INS and SOFTCLIP don't consume reference
+    }
+    return nn;
+}
+
 std::string Sam::format_sa_entry(const Alignment& alignment, uint8_t mapq) const {
     std::string entry;
     entry.append(references.names[alignment.ref_id]);
@@ -533,6 +564,8 @@ void Sam::add_paired_supplementary(
     }
 
     std::string combined_tags = compute_md_tag(alignment.cigar, alignment.ref_id, alignment.ref_start);
+    combined_tags += "\tnn:i:";
+    combined_tags += std::to_string(compute_nn(alignment.cigar, alignment.ref_id, alignment.ref_start));
     if (!mate_primary.is_unaligned) {
         combined_tags += '\t';
         combined_tags += compute_mc_tag(mate_primary.cigar);

@@ -18,6 +18,8 @@ struct Details {
     uint32_t best_alignments{0}; // No. of best alignments with same score
     int s1{0}; // Best chain/NAM score
     int s2{0}; // Second-best chain/NAM score
+    int cm{0}; // Matching seeds in primary chain (n_matches)
+    int xp{0}; // Pipeline path: 0=standard, 5=fast path
 
     HitsDetails hits;
 
