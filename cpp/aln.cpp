@@ -516,9 +516,14 @@ inline Alignment extend_seed(
         const int diff = std::abs(nam.ref_span() - nam.query_span());
         const int ext_left = std::min(50, projected_ref_start);
         const int ref_start = projected_ref_start - ext_left;
-        const int ext_right = std::min(std::size_t(50), ref.size() - nam.ref_end);
-        const auto ref_segm_size = read.size() + diff + ext_left + ext_right;
+        const size_t clamped_ref_end = std::min(static_cast<size_t>(nam.ref_end), ref.size());
+        const int ext_right = std::min(std::size_t(50), ref.size() - clamped_ref_end);
+        const auto ref_segm_size = std::min(
+            read.size() + diff + ext_left + ext_right,
+            ref.size() - static_cast<size_t>(ref_start)
+        );
         std::string_view ref_segm(ref.data() + ref_start, ref_segm_size);
+        assert(static_cast<size_t>(ref_start) + ref_segm_size <= ref.size() && "ref_segm out of bounds");
         auto opt_info = aligner.align(query, ref_segm);
         if (opt_info) {
             info = opt_info.value();
@@ -1433,11 +1438,6 @@ void align_or_map_paired(
                         collector->add(alignment2.ref_id, alignment2.ref_start + alignment2.length);
                         collector->add(s.ref_id, s.ref_start);
                     }
-                    if (!is_proper && !alignment1.is_unaligned && !alignment2.is_unaligned
-                        && isize_est.sample_size >= 100) {
-                        collector->add(alignment1.ref_id, alignment1.ref_start);
-                        collector->add(alignment2.ref_id, alignment2.ref_start);
-                    }
                 }
 
                 // XD/XR + breakpoint tags (pass 2 / normal mode only)
@@ -1668,11 +1668,6 @@ void align_or_map_paired(
                     for (const auto& s : si2.supps) {
                         collector->add(primary2.ref_id, primary2.ref_start + primary2.length);
                         collector->add(s.ref_id, s.ref_start);
-                    }
-                    if (!is_proper && !primary1.is_unaligned && !primary2.is_unaligned
-                        && isize_est.sample_size >= 100) {
-                        collector->add(primary1.ref_id, primary1.ref_start);
-                        collector->add(primary2.ref_id, primary2.ref_start);
                     }
                 }
 

@@ -1,9 +1,11 @@
 #include "svhotspot.hpp"
 #include <algorithm>
+#include <cmath>
 
 void HotspotMap::build(
     const std::vector<SvEvidence>& evidence,
     int n_refs,
+    const std::vector<unsigned int>& ref_lengths,
     int window_size,
     int min_support
 ) {
@@ -33,6 +35,19 @@ void HotspotMap::build(
             j++;
         }
 
+        // Scale min_support based on evidence density for this reference.
+        // If background evidence rate is high, raise the threshold to only
+        // flag windows significantly above the background.
+        size_t ref_evidence_count = j - i;
+        int effective_min_support = min_support;
+        if (ref_id < static_cast<int>(ref_lengths.size()) && ref_lengths[ref_id] > 0) {
+            double density = static_cast<double>(ref_evidence_count) / ref_lengths[ref_id];
+            double expected_per_window = density * window_size;
+            // Require at least 5x the expected background rate
+            int density_threshold = static_cast<int>(std::ceil(expected_per_window * 5.0));
+            effective_min_support = std::max(min_support, density_threshold);
+        }
+
         // Sliding window: for each evidence item, count how many items
         // fall within [position, position + window_size)
         auto& ref_intervals = intervals_[ref_id];
@@ -43,7 +58,7 @@ void HotspotMap::build(
                 left++;
             }
             int count = static_cast<int>(right - left + 1);
-            if (count >= min_support) {
+            if (count >= effective_min_support) {
                 int start = sorted[left].position;
                 int end = sorted[right].position;
 

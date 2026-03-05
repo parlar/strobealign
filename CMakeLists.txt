@@ -1,6 +1,7 @@
 cmake_minimum_required(VERSION 3.16)
 
-project(strobealign VERSION 0.17.0)
+project(strobealign VERSION 0.17.0.1)
+set(PROJECT_VERSION "0.17.0-sv")
 include(FetchContent)
 include(ExternalProject)
 

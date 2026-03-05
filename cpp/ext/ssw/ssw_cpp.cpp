@@ -293,9 +293,10 @@ int Aligner::SetReferenceSequence(const char* seq, const int& length) {
     // delete the current buffer
     CleanReferenceSequence();
     // allocate a new buffer
-    translated_reference_ = new int8_t[length];
+    translated_reference_ = new int8_t[length + 1];
 
     len = TranslateBase(seq, length, translated_reference_);
+    translated_reference_[length] = 4;  // pad with N
   } else {
     // nothing
   }
@@ -342,13 +343,18 @@ uint16_t Aligner::Align(const char* query, const Filter& filter,
 				 flag, filter.score_filter, filter.distance_filter, maskLen);
 
   alignment->Clear();
-  ConvertAlignment(*s_al, query_len, alignment);
-  alignment->mismatches = CalculateNumberMismatch(&*alignment, translated_reference_, translated_query, query_len);
-  uint16_t align_flag = s_al->flag;
+  uint16_t align_flag;
+  if (s_al == nullptr) {
+    align_flag = 1;  // signal failure
+  } else {
+    ConvertAlignment(*s_al, query_len, alignment);
+    alignment->mismatches = CalculateNumberMismatch(&*alignment, translated_reference_, translated_query, query_len);
+    align_flag = s_al->flag;
+    align_destroy(s_al);
+  }
 
   // Free memory
   delete [] translated_query;
-  align_destroy(s_al);
   init_destroy(profile);
 
   return align_flag;
@@ -367,8 +373,9 @@ uint16_t Aligner::Align(const char* query, const char* ref, const int& ref_len,
 
   // calculate the valid length
   int valid_ref_len = ref_len;
-  int8_t* translated_ref = new int8_t[valid_ref_len];
+  int8_t* translated_ref = new int8_t[valid_ref_len + 1];
   TranslateBase(ref, valid_ref_len, translated_ref);
+  translated_ref[valid_ref_len] = 4;  // pad with N to guard banded_sw OOB read
 
 
   const int8_t score_size = 2;
@@ -383,14 +390,19 @@ uint16_t Aligner::Align(const char* query, const char* ref, const int& ref_len,
 				 flag, filter.score_filter, filter.distance_filter, maskLen);
 
   alignment->Clear();
-  ConvertAlignment(*s_al, query_len, alignment);
-  alignment->mismatches = CalculateNumberMismatch(&*alignment, translated_ref, translated_query, query_len);
-  uint16_t align_flag = s_al->flag;
+  uint16_t align_flag;
+  if (s_al == nullptr) {
+    align_flag = 1;  // signal failure
+  } else {
+    ConvertAlignment(*s_al, query_len, alignment);
+    alignment->mismatches = CalculateNumberMismatch(&*alignment, translated_ref, translated_query, query_len);
+    align_flag = s_al->flag;
+    align_destroy(s_al);
+  }
 
   // Free memory
   delete [] translated_query;
   delete [] translated_ref;
-  align_destroy(s_al);
   init_destroy(profile);
 
   return align_flag;

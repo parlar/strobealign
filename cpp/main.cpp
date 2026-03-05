@@ -402,7 +402,7 @@ int run_strobealign(int argc, char **argv) {
         for (auto& c : collectors) {
             all_evidence.insert(all_evidence.end(), c.evidence.begin(), c.evidence.end());
         }
-        hotspot_map.build(all_evidence, references.size());
+        hotspot_map.build(all_evidence, references.size(), references.lengths);
         logger.info() << "Found " << hotspot_map.total_hotspots() << " SV hotspot regions from "
                       << all_evidence.size() << " evidence items\n";
 

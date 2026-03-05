@@ -976,6 +976,11 @@ s_align* ssw_align (const s_profile* prof,
 		free(bests_reverse);
 	}
 
+	if (r->ref_begin1 < 0 || r->read_begin1 < 0) {
+		r->flag = 2;
+		goto end;
+	}
+
 	if ((7&flag) == 0 || ((2&flag) != 0 && r->score1 < filters) || ((4&flag) != 0 && (r->ref_end1 - r->ref_begin1 > filterd || r->read_end1 - r->read_begin1 > filterd))) goto end;
 
 	// Generate cigar.

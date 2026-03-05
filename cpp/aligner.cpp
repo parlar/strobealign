@@ -22,7 +22,6 @@ std::optional<AlignmentInfo> Aligner::align(const std::string &query, std::strin
 
     StripedSmithWaterman::Alignment alignment_ssw;
 
-    // query must be NULL-terminated; ref does not need to be (SSW takes pointer + length)
     auto flag = ssw_aligner.Align(query.c_str(), ref.data(), ref.size(), filter, &alignment_ssw, maskLen);
     if (flag != 0 || alignment_ssw.ref_begin == -1) {
         return {};
