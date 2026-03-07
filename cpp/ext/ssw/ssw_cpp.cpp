@@ -373,9 +373,8 @@ uint16_t Aligner::Align(const char* query, const char* ref, const int& ref_len,
 
   // calculate the valid length
   int valid_ref_len = ref_len;
-  int8_t* translated_ref = new int8_t[valid_ref_len + 1];
+  int8_t* translated_ref = new int8_t[valid_ref_len];
   TranslateBase(ref, valid_ref_len, translated_ref);
-  translated_ref[valid_ref_len] = 4;  // pad with N to guard banded_sw OOB read
 
 
   const int8_t score_size = 2;

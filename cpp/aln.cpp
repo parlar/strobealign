@@ -117,6 +117,15 @@ bool has_significant_soft_clip(const Alignment& primary, int read_len, int min_c
 bool reverse_nam_if_needed(Nam& nam, const Read& read, const References& references, int k) {
     auto read_len = read.size();
     const auto& ref_seq = references.sequences[nam.ref_id];
+
+    // Bounds checks: ensure k-mer extractions don't read out of bounds
+    if (nam.ref_start < 0 || nam.ref_end < k
+        || static_cast<size_t>(nam.ref_end) > ref_seq.size()
+        || nam.query_start < 0 || nam.query_end < k
+        || static_cast<size_t>(nam.query_end) > read_len) {
+        return false;
+    }
+
     const char* ref_start_ptr = ref_seq.data() + nam.ref_start;
     const char* ref_end_ptr = ref_seq.data() + nam.ref_end - k;
 
@@ -161,7 +170,9 @@ inline void align_single(
     SvEvidenceCollector* collector = nullptr,
     bool is_near_hotspot = false,
     const PhasingMap* phasing_map = nullptr,
-    int min_clip = 15
+    int min_clip = 15,
+    float normal_dropoff = 0.0f,
+    int normal_max_tries = 0
 ) {
     if (nams.empty()) {
         sam.add_unmapped(record);
@@ -182,6 +193,15 @@ inline void align_single(
     Alignment best_alignment;
     best_alignment.is_unaligned = true;
 
+    // OC:Z tracking: what the best alignment would be under normal params
+    const bool track_normal = normal_max_tries > 0;
+    Alignment normal_best;
+    normal_best.is_unaligned = true;
+    int normal_best_score = 0;
+    int normal_tries = 0;
+    int normal_best_ed = std::numeric_limits<int>::max();
+    bool normal_stopped = false;
+
     const bool collect_alignments = max_secondary > 0 || max_supplementary > 0;
 
     for (auto &nam : nams) {
@@ -189,18 +209,34 @@ inline void align_single(
         if (tries >= max_tries || (tries > 1 && best_edit_distance == 0) || score_dropoff < dropoff_threshold) {
             break;
         }
+        // Check if normal params would have stopped here
+        if (track_normal && !normal_stopped) {
+            if (normal_tries >= normal_max_tries
+                || (normal_tries > 1 && normal_best_ed == 0)
+                || score_dropoff < normal_dropoff) {
+                normal_stopped = true;
+            }
+        }
         bool consistent_nam = reverse_nam_if_needed(nam, read, references, k);
         details.inconsistent_nams += !consistent_nam;
         auto alignment = extend_seed(aligner, nam, references, read, consistent_nam);
         details.tried_alignment++;
         if (alignment.is_unaligned) {
             tries++;
+            if (track_normal && !normal_stopped) normal_tries++;
             continue;
         }
         details.gapped += alignment.gapped;
 
         if (collect_alignments) {
             alignments.emplace_back(alignment);
+        }
+
+        // Update normal-params best (before normal params would stop)
+        if (track_normal && !normal_stopped && alignment.score > normal_best_score) {
+            normal_best_score = alignment.score;
+            normal_best = alignment;
+            normal_best_ed = alignment.global_ed;
         }
 
         if (alignment.score >= best_score) {
@@ -227,6 +263,7 @@ inline void align_single(
             second_best_score = alignment.score;
         }
         tries++;
+        if (track_normal && !normal_stopped) normal_tries++;
     }
     if (best_alignment.is_unaligned) {
         sam.add_unmapped(record);
@@ -354,6 +391,16 @@ inline void align_single(
             auto xu = compute_xu_posteriors(score_ratio, xf, xe, mappability, max_tied);
             if (!extra_tags.empty()) extra_tags += '\t';
             extra_tags += format_xu_tag(xu);
+        }
+    }
+
+    // OC:Z: original CIGAR when hotspot realignment changed the alignment
+    if (track_normal && !normal_best.is_unaligned) {
+        auto oc = normal_best.cigar.to_string();
+        auto relaxed_cigar = best_alignment.cigar.to_string();
+        if (oc != relaxed_cigar) {
+            if (!extra_tags.empty()) extra_tags += '\t';
+            extra_tags += "OC:Z:" + oc;
         }
     }
 
@@ -1332,6 +1379,7 @@ void align_or_map_paired(
             if (nams_pair[is_r1].size() > 1) details[is_r1].s2 = std::lroundf(nams_pair[is_r1][1].score);
             details[is_r1].cm = nams_pair[is_r1][0].n_matches;
             details[is_r1].xc = std::lroundf(nams_pair[is_r1][0].score);
+            details[is_r1].xp_repeat = classify_repeat_type(nams_pair[is_r1], details[is_r1].hits);
         }
     }
 
@@ -1371,6 +1419,30 @@ void align_or_map_paired(
     } else {
         Read read1(record1.seq);
         Read read2(record2.seq);
+
+        // OC:Z: capture normal-params CIGARs for hotspot reads
+        std::string oc_cigar1, oc_cigar2;
+        if (is_near_hotspot && relaxed_params) {
+            auto nams1_copy = nams_pair[0];
+            auto nams2_copy = nams_pair[1];
+            std::array<Details, 2> temp_details{};
+            auto normal_pairs = align_paired(
+                aligner, nams1_copy, nams2_copy, read1, read2,
+                index_parameters.syncmer.k, references, temp_details,
+                map_param.dropoff_threshold, isize_est,
+                map_param.max_tries, map_param.rescue_sigma_mult
+            );
+            if (!normal_pairs.empty()) {
+                if (normal_pairs.size() > 1) {
+                    std::sort(normal_pairs.begin(), normal_pairs.end(), by_score<ScoredAlignmentPair>);
+                }
+                if (!normal_pairs[0].alignment1.is_unaligned)
+                    oc_cigar1 = normal_pairs[0].alignment1.cigar.to_string();
+                if (!normal_pairs[0].alignment2.is_unaligned)
+                    oc_cigar2 = normal_pairs[0].alignment2.cigar.to_string();
+            }
+        }
+
         auto alignment_pairs = align_paired(
             aligner, nams_pair[0], nams_pair[1], read1, read2,
             index_parameters.syncmer.k, references, details,
@@ -1514,8 +1586,16 @@ void align_or_map_paired(
                     }
                 }
 
-                // Tag hotspot-realigned reads
+                // OC:Z + XH: hotspot-realigned reads
                 if (is_near_hotspot) {
+                    if (!oc_cigar1.empty() && oc_cigar1 != alignment1.cigar.to_string()) {
+                        if (!extra1.empty()) extra1 += '\t';
+                        extra1 += "OC:Z:" + oc_cigar1;
+                    }
+                    if (!oc_cigar2.empty() && oc_cigar2 != alignment2.cigar.to_string()) {
+                        if (!extra2.empty()) extra2 += '\t';
+                        extra2 += "OC:Z:" + oc_cigar2;
+                    }
                     if (!extra1.empty()) extra1 += '\t';
                     extra1 += "XH:i:1";
                     if (!extra2.empty()) extra2 += '\t';
@@ -1745,8 +1825,16 @@ void align_or_map_paired(
                     }
                 }
 
-                // Tag hotspot-realigned reads
+                // OC:Z + XH: hotspot-realigned reads
                 if (is_near_hotspot) {
+                    if (!oc_cigar1.empty() && oc_cigar1 != primary1.cigar.to_string()) {
+                        if (!extra1.empty()) extra1 += '\t';
+                        extra1 += "OC:Z:" + oc_cigar1;
+                    }
+                    if (!oc_cigar2.empty() && oc_cigar2 != primary2.cigar.to_string()) {
+                        if (!extra2.empty()) extra2 += '\t';
+                        extra2 += "OC:Z:" + oc_cigar2;
+                    }
                     if (!extra1.empty()) extra1 += '\t';
                     extra1 += "XH:i:1";
                     if (!extra2.empty()) extra2 += '\t';
@@ -1865,6 +1953,7 @@ void align_or_map_single(
         if (nams.size() > 1) details.s2 = std::lroundf(nams[1].score);
         details.cm = nams[0].n_matches;
         details.xc = std::lroundf(nams[0].score);
+        details.xp_repeat = classify_repeat_type(nams, details.hits);
     }
 
     Timer extend_timer;
@@ -1909,7 +1998,9 @@ void align_or_map_single(
                 references, details, se_params.dropoff_threshold, se_params.max_tries,
                 se_params.max_secondary, se_params.max_supplementary,
                 se_params.max_supp_overlap, random_engine, se_params.sv_tags,
-                collector, se_near_hotspot, phasing_map, se_params.min_clip
+                collector, se_near_hotspot, phasing_map, se_params.min_clip,
+                se_near_hotspot ? map_param.dropoff_threshold : 0.0f,
+                se_near_hotspot ? map_param.max_tries : 0
             );
             break;
         }

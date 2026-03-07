@@ -24,6 +24,7 @@ struct Details {
     int xc{0}; // Primary chain/NAM score (before extension)
     int xs{0}; // Best non-primary alignment score (XS tag)
     float yj{-1.0f}; // Joint pair posterior probability, -1 = not set
+    char xp_repeat{0}; // XP repeat class: U=UNQ, T=TAN, S=SEG, D=DIS, 0=not set
 
     HitsDetails hits;
 

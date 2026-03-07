@@ -5,6 +5,7 @@
 #include <utility>
 #include <vector>
 
+#include "nam.hpp"
 #include "refs.hpp"
 #include "sam.hpp"
 #include "statistics.hpp"
@@ -85,5 +86,13 @@ XuPosteriors compute_xu_posteriors(
     int tied_count);
 
 std::string format_xu_tag(const XuPosteriors& xu);
+
+/*
+ * Classify the mapping region repeat type from NAM distribution and hit stats.
+ * Returns: 'U' (unique), 'T' (tandem), 'S' (segdup), 'D' (dispersed).
+ */
+char classify_repeat_type(
+    const std::vector<Nam>& nams,
+    const HitsDetails& hits);
 
 #endif

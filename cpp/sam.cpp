@@ -283,6 +283,19 @@ void Sam::add_record(
             sam_string.append("\tXW:f:");
             sam_string.append(xw_buf);
         }
+        if (details.xp_repeat) {
+            const char* label = nullptr;
+            switch (details.xp_repeat) {
+                case 'U': label = "UNQ"; break;
+                case 'T': label = "TAN"; break;
+                case 'S': label = "SEG"; break;
+                case 'D': label = "DIS"; break;
+            }
+            if (label) {
+                sam_string.append("\tXP:Z:");
+                sam_string.append(label);
+            }
+        }
     } else {
         append_qual(qual);
     }

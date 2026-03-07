@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <set>
 #include <vector>
 
 std::string BreakpointInfo::format_all(const References& refs) const {
@@ -448,4 +449,48 @@ std::string format_xu_tag(const XuPosteriors& xu) {
     char buf[64];
     std::snprintf(buf, sizeof(buf), "XU:Z:REF:%.2f,SV:%.2f,RPT:%.2f", xu.ref, xu.sv, xu.rpt);
     return buf;
+}
+
+char classify_repeat_type(
+    const std::vector<Nam>& nams,
+    const HitsDetails& hits
+) {
+    if (nams.empty()) return 'U';
+
+    float total_hits = static_cast<float>(hits.total_hits());
+    float filtered = static_cast<float>(hits.total_filtered());
+    float filtered_ratio = total_hits > 0 ? filtered / total_hits : 0.0f;
+
+    float best_score = nams[0].score;
+    if (best_score <= 0) return 'U';
+
+    // Collect NAMs with score >= 70% of best
+    float threshold = best_score * 0.7f;
+    std::set<int> strong_refs;
+    int same_ref_count = 0;
+    int primary_ref = nams[0].ref_id;
+    for (const auto& nam : nams) {
+        if (nam.score < threshold) break;
+        strong_refs.insert(nam.ref_id);
+        if (nam.ref_id == primary_ref) same_ref_count++;
+    }
+
+    // High filtered ratio: many seeds are repetitive
+    if (filtered_ratio > 0.5f) {
+        if (strong_refs.size() >= 3) return 'D'; // dispersed
+        if (strong_refs.size() >= 2) return 'S'; // segdup
+        // Same ref, many filtered seeds → tandem repeat
+        return 'T';
+    }
+
+    // Moderate: check if there are strong alternative mappings
+    float score_ratio = nams.size() > 1 ? nams[1].score / best_score : 0.0f;
+    if (score_ratio >= 0.7f) {
+        if (strong_refs.size() >= 3) return 'D';
+        if (strong_refs.size() >= 2) return 'S';
+        if (same_ref_count >= 2) return 'T';
+        return 'S';
+    }
+
+    return 'U';
 }
